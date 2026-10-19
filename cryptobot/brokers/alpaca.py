@@ -66,6 +66,8 @@ class AlpacaCryptoBroker(Broker):
 
     # the protective limit sits this far through the stop so a fast move still fills
     PROTECTIVE_LIMIT_GAP = 0.005
+    # crypto market orders usually fill well inside a second: check often, not once a second
+    FILL_POLL_SECONDS = 0.2
 
     def __init__(
         self,
@@ -288,7 +290,7 @@ class AlpacaCryptoBroker(Broker):
             current = self.get_order(order.id, order.symbol)
             if current.is_done:
                 return current
-            self.sleep(1.0)
+            self.sleep(self.FILL_POLL_SECONDS)
         return current
 
     def cancel(self, order_id: str) -> None:
