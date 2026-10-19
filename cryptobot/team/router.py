@@ -92,9 +92,9 @@ class Router:
 
         queue, self._queue = self._queue, []
         live: list[dict] = []
-        pending_sells: dict[tuple[str, str], float] = {}
+        pending: dict[tuple[str, str], float] = {}  # (bot, symbol) -> net qty queued so far
         for intent in queue:
-            reason = self._precheck(intent, ts, killed, pending_sells)
+            reason = self._precheck(intent, ts, killed, pending)
             if reason:
                 reports.append(self._rejection(intent, reason))
             else:
@@ -189,23 +189,25 @@ class Router:
         intent: dict,
         ts: datetime,
         killed: bool,
-        pending_sells: dict[tuple[str, str], float],
+        pending: dict[tuple[str, str], float],
     ) -> str:
         """Empty string when the intent may proceed, else the rejection reason.
-        Sells that reduce an existing long are always allowed; buys are blocked
-        by the kill switch, a missing mark, or a stale mark."""
+        Sells that reduce a long are always allowed, counting the buys queued
+        earlier in the same batch (a bot that entered at the open and was
+        stopped out in the same bar sells what it has not yet been booked);
+        buys are blocked by the kill switch, a missing mark, or a stale mark."""
         bot_id, symbol, side, qty = (
             intent["bot_id"],
             intent["symbol"],
             intent["side"],
             intent["qty"],
         )
+        key = (bot_id, symbol)
         if side == "sell":
             held = self.accounts[bot_id].positions.get(symbol, (0.0, 0.0))[0]
-            already = pending_sells.get((bot_id, symbol), 0.0)
-            if qty + already > held + 1e-9:
+            if qty > held + pending.get(key, 0.0) + 1e-9:
                 return "sell exceeds position"
-            pending_sells[(bot_id, symbol)] = already + qty
+            pending[key] = pending.get(key, 0.0) - qty
             return ""
         if killed:
             return "kill switch active"
@@ -214,6 +216,7 @@ class Router:
             return "no mark for symbol"
         if (ts - marked[1]).total_seconds() > self.limits.stale_after_seconds:
             return "stale mark"
+        pending[key] = pending.get(key, 0.0) + qty
         return ""
 
     def _cross(self, symbol: str, buys: list[dict], sells: list[dict]) -> list[dict]:

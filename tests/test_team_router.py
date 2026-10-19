@@ -214,6 +214,32 @@ def test_broker_rejection_books_nothing(tmp_path):
     assert accounts["a"].cash == pytest.approx(100.0) and accounts["a"].positions == {}
 
 
+def test_same_bot_round_trip_in_one_tick_never_reaches_the_broker(tmp_path):
+    """Entry at the bar's open and a stop later in the same bar arrive in one flush:
+    the sell must be allowed against the queued buy and the pair crossed internally,
+    otherwise the buy alone would go to the real account for a trade the bot closed."""
+    broker, accounts, router = make_team(tmp_path)
+    router.mark("BTC/USD", 100.0, T0)
+    router.submit("a", "BTC/USD", "buy", 1, 100.0)
+    router.submit("a", "BTC/USD", "sell", 1, 99.0)
+    reports = router.flush(T0)
+    assert broker.orders == []
+    assert len(reports) == 1 and reports[0]["internal"] is True
+    assert reports[0]["bots"] == ["a", "a"]
+    assert "BTC/USD" not in accounts["a"].positions
+    fee_side = FEES_ONLY.fees(100.0)
+    assert accounts["a"].cash == pytest.approx(10_000 - 2 * fee_side)
+    # selling more than held plus queued buys is still refused
+    router.submit("a", "BTC/USD", "buy", 1, 100.0)
+    router.submit("a", "BTC/USD", "sell", 2, 100.0)
+    reports = router.flush(T0)
+    rejected = [r for r in reports if r.get("rejected")]
+    filled = [r for r in reports if r.get("internal") is False]
+    assert len(rejected) == 1 and "exceeds" in rejected[0]["reason"]
+    assert len(filled) == 1 and filled[0]["side"] == "buy"  # only the buy went through
+    assert accounts["a"].positions["BTC/USD"][0] == pytest.approx(1)
+
+
 def test_unfilled_residual_is_cancelled_and_the_partial_is_booked(tmp_path):
     """A residual that is still open after the fill wait must be cancelled (so it cannot
     fill later behind the books) and whatever did fill must land in the bot's books."""
