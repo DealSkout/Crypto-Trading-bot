@@ -65,12 +65,14 @@ def test_fetch_alpaca_uses_the_crypto_bars_request():
 
 def test_cache_merge_and_fallback(cfg, monkeypatch):
     client = FakeCryptoClient(alpaca_frame(n=6))
-    first = get_bars(cfg, "BTC/USD", provider="alpaca", client=client)
+    first = get_bars(cfg, "BTC/USD", provider="alpaca", client=client, now=NOW)
     assert data.cache_path(cfg, "BTC/USD").exists() and len(first) == 6
-    cached = get_bars(cfg, "BTC/USD", provider="alpaca", client=FakeCryptoClient(fail=True))
+    cached = get_bars(
+        cfg, "BTC/USD", provider="alpaca", client=FakeCryptoClient(fail=True), now=NOW
+    )
     assert len(cached) == 6  # falls back to the cache
     with pytest.raises(DataError):
-        get_bars(cfg, "ETH/USD", provider="alpaca", client=FakeCryptoClient(fail=True))
+        get_bars(cfg, "ETH/USD", provider="alpaca", client=FakeCryptoClient(fail=True), now=NOW)
 
 
 def test_csv_provider(cfg, tmp_path):
@@ -85,3 +87,25 @@ def test_csv_provider(cfg, tmp_path):
 
 def test_now_is_utc():
     assert NOW.tzinfo is not None and datetime.now(UTC).tzinfo is not None
+
+
+def _utc(ts) -> pd.Timestamp:
+    ts = pd.Timestamp(ts)
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
+def test_incremental_fetch_only_asks_for_what_the_cache_lacks(cfg):
+    client = FakeCryptoClient(alpaca_frame(n=6))
+    get_bars(cfg, "BTC/USD", provider="alpaca", client=client, lookback_days=2, now=NOW)
+    assert len(client.requests) == 1  # empty cache: one full request
+    client2 = FakeCryptoClient(alpaca_frame(n=6))
+    get_bars(cfg, "BTC/USD", provider="alpaca", client=client2, lookback_days=2, now=NOW)
+    tail = client2.requests[0]
+    last = pd.Timestamp("2026-10-15 00:25", tz="UTC")
+    assert _utc(tail.start) == last - pd.Timedelta(minutes=15)  # small overlap only
+    # a longer lookback than the cache holds also fetches the missing older history
+    client3 = FakeCryptoClient(alpaca_frame(n=6))
+    get_bars(cfg, "BTC/USD", provider="alpaca", client=client3, lookback_days=30, now=NOW)
+    assert len(client3.requests) == 2
+    head = client3.requests[1]
+    assert _utc(head.end) == pd.Timestamp("2026-10-15 00:00", tz="UTC")

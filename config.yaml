@@ -3,7 +3,7 @@
 mode: paper              # paper | live   (live also needs CRYPTOBOT_LIVE_CONFIRM=yes in .env)
 broker: alpaca           # alpaca | paper   (paper = built-in simulator; with mode: paper, alpaca trades
                          # your Alpaca PAPER account. Give this bot its own paper account.)
-symbols: [BTC/USD, ETH/USD]   # USD crypto pairs (USD, USDT or USDC quotes). Long-only.
+symbols: [BTC/USD, ETH/USD, SOL/USD]   # USD crypto pairs (USD, USDT or USDC quotes). Long-only.
 timeframe: 5m            # 1m | 5m | 15m
 strategy: orb            # orb | intraday_momentum | vwap_revert   (the "session" is the UTC day)
 params: {range_minutes: 30, target_r: 3}
@@ -18,6 +18,17 @@ risk:
   flatten_minutes_before_close: 10 # flatten everything this long before 00:00 UTC (day trading)
   max_stop_pct: 3.0                # no stop may sit further than this from the entry, whoever set it
   max_total_exposure_pct: 100      # all open positions together, as % of equity (100 = no leverage)
+  # Position sizing. Whatever the method, a trade never risks more than risk_per_trade_pct.
+  sizing: min                      # risk | vol_target | kelly | min (the smallest of all three)
+  target_daily_vol_pct: 1.0        # vol_target: a position's typical daily move <= 1% of equity
+  kelly_fraction: 0.25             # kelly: a quarter of the Kelly fraction (never more than 0.25)
+  kelly_min_trades: 30             # ...measured on the last closed trades, once there are 30
+  kelly_lookback_trades: 100
+  kelly_floor_pct: 0.1             # with no measured edge, keep trading at 0.1% risk to learn
+  # Automatic pauses of NEW entries (open trades keep their stops and exits):
+  pause_on_macro: true             # inside a macro_calendar.yaml high-risk window (FOMC, CPI...)
+  pause_on_stale_data: true        # no new bar for stale_bars bar lengths, or a required research
+  stale_bars: 3                    #   source (research.required_sources) gone stale
 
 costs:
   commission: 0                    # flat per order, USD (Alpaca crypto: 0)
@@ -25,6 +36,8 @@ costs:
                                    # Check your tier on Alpaca's fee page and lower it if yours is less.
   spread_bps: 5                    # full bid-ask spread; half is paid on each side
   slippage_bps: 5                  # per side
+  stop_gap_bps: 10                 # simulations: stop exits fill this far through the stop (stops
+                                   # are polled every poll_seconds and closed at the market)
 
 # How orders are sent. Alpaca crypto accepts only market, limit and stop_limit orders, with
 # time in force gtc or ioc. Exits (stops, targets, end of day) are always market orders.
@@ -33,18 +46,31 @@ orders:
   entry_type: market               # market | limit (a marketable limit limit_offset_bps through the price)
   limit_offset_bps: 10
   fill_timeout_seconds: 30         # an entry not filled by then is cancelled (no trade)
+  backup_stop: true                # also rest a stop_limit at Alpaca behind each software stop, so a
+                                   # crashed bot still has protection (cancelled before normal exits)
+  backup_stop_buffer_pct: 0        # how far beyond the software stop the backup sits (0 = at it)
 
 data:
   provider: alpaca                 # alpaca (alpaca-py crypto bars) | csv | synthetic
-  lookback_days: 60
+  lookback_days: 365              # a year of 5m bars: the learning loop needs 50+ out-of-sample trades
   cache_dir: cache
   csv_dir: data
 
+# The weekly self-learning loop (`python -m cryptobot learn`, run by the systemd timer).
+# It may only start shadow runs and, after a clean 2-week shadow, change the PAPER champion.
+# It never touches live trading (approve-live is a human command) or anything under risk:.
 learning:
-  refit_every_days: 5              # walk-forward re-fit of params on the training window
-  min_oos_trades: 30               # a challenger needs this many out-of-sample trades
-  min_sharpe_gain: 0.1             # ...and must beat the champion's Sharpe by this much, after costs
-  train_fraction: 0.7              # first 70% of days = train, last 30% = out-of-sample
+  strategies: [orb, vwap_revert]   # intraday_momentum is left out: it cannot cover its costs
+  max_challengers: 20
+  holdout_fraction: 0.3            # last 30% of days = the out-of-sample holdout
+  min_oos_trades: 50               # holdout trades a challenger needs
+  min_sharpe_gain: 0.25            # holdout Sharpe must beat the champion's by this much...
+  dsr_min: 0.95                    # ...and the deflated Sharpe must say it is not luck
+  max_pbo: 0.5                     # probability of backtest overfitting allowed
+  min_profitable_regimes: 2
+  shadow_days: 14                  # a winner shadows the champion this long before promotion
+  workers: 0                       # parallel simulations (0 = CPU count - 1)
+  train_fraction: 0.7              # the plain backtest's train/test split
 
 # The coach NEVER applies anything: it writes reviews and proposals for you to read.
 coach:
@@ -91,13 +117,39 @@ guardian:
   min_trades_for_judgement: 10
   expected_range_r: 1.0            # average R this far below the backtest's: stop
   provider: claude                 # AI reviewer: claude | ollama | none (needs ANTHROPIC_API_KEY; the rules apply without it)
-  model: claude-opus-5-5
+  model: claude-haiku-5-5          # one short review a day: Haiku is plenty and costs far less
   ollama_model: llama3.1:8b
   min_confidence: 0.7              # the AI's stop needs at least this confidence
   max_daily_cost_usd: 0.50
   stop_file: cryptobot.STOPPED
 
+# Market research feed: free public data, cached, scheduled. It never trades: it adds features
+# to every decision, flags macro windows and writes one short digest a day.
+research:
+  enabled: true
+  exchanges: [okx, bybit, binance]  # funding rates and open interest: first that answers wins
+  rss_feeds:                         # headlines, scored locally with VADER (no LLM)
+    - https://www.coindesk.com/arc/outboundfeeds/rss/
+    - https://cointelegraph.com/rss
+    - https://www.theblock.co/rss.xml
+  cryptopanic: false                 # true + CRYPTOPANIC_TOKEN in .env adds CryptoPanic news
+  calendar_file: macro_calendar.yaml # FOMC, CPI, token unlocks: KEEP IT UP TO DATE
+  required_sources: []               # e.g. [funding]: new entries pause if these go stale
+  digest: true                       # at most ONE Claude call a day (Haiku); numbers only without a key
+  digest_model: claude-haiku-5-5
+  max_daily_cost_usd: 0.05
+
+# Market regimes, one label per market per UTC day from completed days only. Results are
+# tracked per regime; the learning loop needs a challenger to be profitable in at least two.
+regime:
+  high_vol_ratio: 1.6              # 5-day volatility this many times the 20-day = high_vol
+  trending_efficiency: 0.35        # 14-day efficiency ratio at or above this = trending (else ranging)
+  risk_off_breadth: 0.34           # risk_off: at most a third of markets above their 20-day average
+  risk_off_market_ret_pct: -10     #   and the average 20-day return at or below -10%
+  risk_off_fear_greed: 20          #   or Fear & Greed at or below 20 with half the markets below average
+
 poll_seconds: 30                   # how often the 24/7 loop checks prices for software stops
 journal_path: cryptobot.sqlite
 reports_dir: reports
+store_dir: store                   # Parquet copy of every decision and trade (with features), daily
 telegram: true                     # send daily summaries if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID are set

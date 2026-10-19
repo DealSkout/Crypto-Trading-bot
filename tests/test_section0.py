@@ -2,8 +2,6 @@
 metrics with Sortino and the first day's return, timestamp-based ORB, and
 skip-log deduplication."""
 
-from datetime import timedelta
-
 import pandas as pd
 import pytest
 

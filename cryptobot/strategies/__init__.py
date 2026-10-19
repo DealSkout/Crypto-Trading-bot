@@ -8,7 +8,12 @@ A strategy is a module with one pure function:
 for one symbol, indexed by bar start time in the exchange's timezone. Return a Signal to enter
 at the market now, or None. No I/O, no broker calls, no randomness that is not seeded by params.
 Optional module attributes: DEFAULT_PARAMS (dict) and PARAM_GRID (dict of lists) for the
-learning loop.
+learning loop, and
+
+    def due(symbol: str, start: datetime, tf: int, params: dict) -> bool
+
+a cheap, pure pre-check from the bar's start time alone: False means `signal` would certainly
+return None on this bar, so the engine can skip building the bar window (backtest speed).
 """
 
 from __future__ import annotations
@@ -73,6 +78,12 @@ def load_strategy(name_or_path: str) -> ModuleType:
     if not callable(getattr(module, "signal", None)):
         raise ValueError(f"strategy {name_or_path!r} has no signal(bars, params) function")
     return module
+
+
+def due_check(module: ModuleType):
+    """The strategy's optional `due` pre-check, or None."""
+    fn = getattr(module, "due", None)
+    return fn if callable(fn) else None
 
 
 def default_params(module: ModuleType) -> dict:

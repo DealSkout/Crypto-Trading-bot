@@ -24,7 +24,8 @@ from cryptobot.risk import RiskManager
 from cryptobot.strategies import default_params, load_strategy, strategy_name
 
 HISTORY_SESSIONS = 25  # how many sessions of history a strategy sees
-TRADING_DAYS_PER_YEAR = 365  # crypto trades every day; 252 understates Sharpe by ~17%
+PERIODS_PER_YEAR = 365  # crypto trades every day of the year: annualise daily returns by 365
+TRADING_DAYS_PER_YEAR = PERIODS_PER_YEAR  # older name, kept for compatibility
 
 
 def cost_model(cfg: Config) -> CostModel:
@@ -63,6 +64,7 @@ class BacktestResult:
     params_history: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     decider: str = "none"
+    regime_table: list[dict[str, Any]] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
     @property
@@ -135,6 +137,8 @@ def run_period(
     days: list[date],
     journal: Journal | None = None,
     decider=None,
+    context_providers: list | None = None,
+    filters: dict[str, Any] | None = None,
 ) -> tuple[Engine, pd.DataFrame, pd.Series]:
     """Drive the engine over `days`, giving each strategy call up to HISTORY_SESSIONS of
     history before the first active day. Returns (engine, trades, equity curve in UTC)."""
@@ -150,24 +154,44 @@ def run_period(
     engine = Engine(
         cfg, strategy, params, broker, risk, journal or Journal(":memory:"), decider=decider
     )
+    engine.context_providers = list(context_providers or [])
+    engine.filters = dict(filters or {})
     active = set(days)
     events: list[tuple[pd.Timestamp, str, int]] = []
+    arrays: dict[str, tuple] = {}
     for symbol, bars in bars_by_symbol.items():
         dates = bars.index.date
+        idx_utc = bars.index.tz_convert("UTC")
+        arrays[symbol] = (
+            bars["open"].to_numpy(dtype=float),
+            bars["high"].to_numpy(dtype=float),
+            bars["low"].to_numpy(dtype=float),
+            bars["close"].to_numpy(dtype=float),
+            idx_utc.to_pydatetime(),
+        )
         for i in np.flatnonzero(np.isin(dates, list(active))):
-            events.append((bars.index[i].tz_convert("UTC"), symbol, int(i)))
+            events.append((idx_utc[i], symbol, int(i)))
     events.sort(key=lambda e: (e[0], e[1]))
     hist = {
         s: HISTORY_SESSIONS * (sessions.market_for(s).session_minutes // cfg.timeframe_minutes)
         for s in bars_by_symbol
     }
+    tf = int(cfg.timeframe_minutes)
+
+    def window_for(symbol: str, i: int):
+        def build() -> pd.DataFrame:
+            bars = bars_by_symbol[symbol]
+            w = bars.iloc[max(0, i + 1 - hist[symbol]) : i + 1]
+            w.attrs = {**bars.attrs, "symbol": symbol, "timeframe": tf}
+            return w
+
+        return build
+
     last_ts = None
     for _ts, symbol, i in events:
-        bars = bars_by_symbol[symbol]
-        window = bars.iloc[max(0, i + 1 - hist[symbol]) : i + 1]
-        window.attrs = dict(bars.attrs)
-        engine.on_bar(symbol, window)
-        last_ts = window.index[-1].to_pydatetime()
+        o, h, lo, c, stamps = arrays[symbol]
+        last_ts = stamps[i]
+        engine.process_bar(symbol, last_ts, tf, o[i], h[i], lo[i], c[i], window_for(symbol, i))
     engine.end_of_data(last_ts)
     trades = pd.DataFrame([t.to_dict() for t in engine.trades])
     if trades.empty:
@@ -203,24 +227,46 @@ def run_period(
     return engine, trades, equity
 
 
+def daily_returns(equity: pd.Series, starting_cash: float) -> pd.Series:
+    """Daily returns from an equity curve, counting the first day against the starting cash
+    (so the first day's result is not silently dropped)."""
+    if not len(equity):
+        return pd.Series(dtype=float)
+    daily = equity.groupby(equity.index.normalize()).last()
+    first = daily.index[0] - pd.Timedelta(days=1)
+    daily = pd.concat([pd.Series([float(starting_cash)], index=[first]), daily])
+    return daily.pct_change().dropna()
+
+
+def sharpe_sortino(rets: pd.Series, periods: int = PERIODS_PER_YEAR) -> tuple[float, float]:
+    """Annualised Sharpe and Sortino of per-period returns (0 when undefined)."""
+    if len(rets) < 2:
+        return 0.0, 0.0
+    mean = float(rets.mean())
+    std = float(rets.std(ddof=1))
+    downside = float(np.sqrt(np.mean(np.minimum(rets.to_numpy(dtype=float), 0.0) ** 2)))
+    sharpe = mean / std * np.sqrt(periods) if std > 0 else 0.0
+    sortino = mean / downside * np.sqrt(periods) if downside > 0 else 0.0
+    return float(sharpe), float(sortino)
+
+
+def max_drawdown_pct(equity: pd.Series, starting_cash: float | None = None) -> float:
+    if not len(equity):
+        return 0.0
+    curve = equity.astype(float)
+    if starting_cash is not None:
+        curve = pd.concat([pd.Series([float(starting_cash)]), curve.reset_index(drop=True)])
+    running_max = curve.cummax()
+    return float(((curve / running_max) - 1.0).min() * 100.0)
+
+
 def compute_metrics(
     trades: pd.DataFrame, equity: pd.Series, starting_cash: float
 ) -> dict[str, Any]:
     final = float(equity.iloc[-1]) if len(equity) else float(starting_cash)
-    daily = equity.groupby(equity.index.normalize()).last() if len(equity) else equity
-    trading_days = int(len(daily))
-    if len(daily):
-        # anchor at starting cash the day before, so the first day's return counts too
-        day0 = daily.index[0] - pd.Timedelta(days=1)
-        daily = pd.concat([pd.Series([float(starting_cash)], index=[day0]), daily])
-    rets = daily.pct_change().dropna()
-    std = float(rets.std(ddof=1)) if len(rets) > 1 else 0.0
-    sharpe = float(rets.mean()) / std * np.sqrt(TRADING_DAYS_PER_YEAR) if std > 0 else 0.0
-    downside = rets[rets < 0]
-    dstd = float(downside.std(ddof=1)) if len(downside) > 1 else 0.0
-    sortino = float(rets.mean()) / dstd * np.sqrt(TRADING_DAYS_PER_YEAR) if dstd > 0 else 0.0
-    running_max = equity.cummax() if len(equity) else equity
-    drawdown = float(((equity / running_max) - 1.0).min() * 100.0) if len(equity) else 0.0
+    rets = daily_returns(equity, starting_cash)
+    sharpe, sortino = sharpe_sortino(rets)
+    drawdown = max_drawdown_pct(equity, starting_cash)
     n = int(len(trades))
     pnl = trades["pnl"].astype(float) if n else pd.Series(dtype=float)
     wins, losses = pnl[pnl > 0], pnl[pnl < 0]
@@ -233,15 +279,15 @@ def compute_metrics(
         "net_return_pct": (final / starting_cash - 1.0) * 100.0,
         "final_equity": final,
         "max_drawdown_pct": drawdown,
-        "sharpe": float(sharpe),
-        "sortino": float(sortino),
+        "sharpe": sharpe,
+        "sortino": sortino,
         "n_trades": n,
         "win_rate_pct": float((pnl > 0).mean() * 100.0) if n else 0.0,
         "avg_r": float(trades["r_multiple"].astype(float).mean()) if n else 0.0,
         "avg_pnl": float(pnl.mean()) if n else 0.0,
         "profit_factor": profit_factor,
         "total_costs": float(trades["costs"].astype(float).sum()) if n else 0.0,
-        "trading_days": trading_days,
+        "trading_days": int(len(rets)),
     }
 
 
@@ -330,6 +376,7 @@ def run_backtest(
     journal: Journal | None = None,
     notes: list[str] | None = None,
     decider=None,
+    context_providers: list | None = None,
 ) -> BacktestResult:
     module = (
         strategy if isinstance(strategy, ModuleType) else load_strategy(strategy or cfg.strategy)
@@ -339,10 +386,23 @@ def run_backtest(
     if not days:
         raise ValueError("no bars to backtest")
     train_days, test_days = split_days(days, cfg.learning.train_fraction)
+    from cryptobot.regime import RegimeDetector, regime_performance
 
-    _, is_trades, is_equity = run_period(cfg, module, base, bars_by_symbol, train_days)
+    regimes = RegimeDetector.from_bars(cfg.regime, bars_by_symbol)
+    providers = [regimes.context, *(context_providers or [])]
+
+    _, is_trades, is_equity = run_period(
+        cfg, module, base, bars_by_symbol, train_days, context_providers=providers
+    )
     oos_engine, oos_trades, oos_equity = run_period(
-        cfg, module, base, bars_by_symbol, test_days, journal, decider=decider
+        cfg,
+        module,
+        base,
+        bars_by_symbol,
+        test_days,
+        journal,
+        decider=decider,
+        context_providers=providers,
     )
     metrics = compute_metrics(oos_trades, oos_equity, cfg.starting_cash)
     metrics["cash_capped_entries"] = oos_engine.capped_entries
@@ -384,4 +444,5 @@ def run_backtest(
         bench_equity={"buy_and_hold": bh_equity, "random_entry": rnd_equity},
         notes=notes,
         decider=decider.describe() if decider is not None else "none",
+        regime_table=regime_performance(oos_trades).to_dict("records"),
     )

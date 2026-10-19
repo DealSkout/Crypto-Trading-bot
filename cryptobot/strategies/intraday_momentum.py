@@ -13,6 +13,7 @@ import pandas as pd
 from cryptobot.strategies import Signal
 from cryptobot.strategies.common import (
     bar_minutes,
+    minute_of_day,
     minutes_to_close,
     prior_session_close,
     today_bars,
@@ -25,6 +26,13 @@ DEFAULT_PARAMS = {
     "min_abs_return_pct": 0.0,
 }
 PARAM_GRID = {"opening_minutes": [30, 60], "stop_pct": [0.3, 0.6]}
+
+
+def due(symbol: str, start, tf: int, params: dict) -> bool:
+    """True only on the bar whose end opens the final entry window."""
+    window = float({**DEFAULT_PARAMS, **(params or {})}["entry_minutes_before_close"])
+    end_mtc = 1440.0 - (minute_of_day(start) + tf)
+    return end_mtc <= window < end_mtc + tf
 
 
 def signal(bars: pd.DataFrame, params: dict) -> Signal | None:

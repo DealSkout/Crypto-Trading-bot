@@ -25,6 +25,12 @@ def bar_minutes(bars: pd.DataFrame) -> int:
     return int(round(float(np.min(diffs)))) if len(diffs) else 5
 
 
+def minute_of_day(ts) -> float:
+    """Minutes since 00:00 UTC (the crypto session open) of a timestamp."""
+    ts = pd.Timestamp(ts).tz_convert("UTC")
+    return ts.hour * 60 + ts.minute + ts.second / 60.0
+
+
 def now_of(bars: pd.DataFrame):
     """'Now' is the END of the last completed bar."""
     return bars.index[-1] + timedelta(minutes=bar_minutes(bars))
@@ -78,13 +84,21 @@ def daily_atr(bars: pd.DataFrame, n: int = 14, exclude_today: bool = True) -> fl
     return float(tr.mean()) if len(tr) else None
 
 
+def vwap_array(high, low, close, volume) -> np.ndarray:
+    """Session VWAP as a numpy array (bars with no volume carry the running typical price)."""
+    tp = (np.asarray(high, float) + np.asarray(low, float) + np.asarray(close, float)) / 3.0
+    vol = np.clip(np.asarray(volume, float), 0.0, None)
+    cum_vol = np.cumsum(vol)
+    cum_tp = np.cumsum(tp * vol)
+    fallback = np.cumsum(tp) / np.arange(1, len(tp) + 1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = np.where(cum_vol > 0, cum_tp / np.where(cum_vol > 0, cum_vol, 1.0), fallback)
+    return out
+
+
 def vwap(df: pd.DataFrame) -> pd.Series:
-    tp = (df["high"] + df["low"] + df["close"]) / 3.0
-    vol = df["volume"].clip(lower=0)
-    cum_vol = vol.cumsum()
-    cum_tp = (tp * vol).cumsum()
-    out = cum_tp / cum_vol.replace(0, np.nan)
-    return out.fillna(tp.expanding().mean())
+    out = vwap_array(df["high"], df["low"], df["close"], df["volume"])
+    return pd.Series(out, index=df.index)
 
 
 def minutes_to_close(bars: pd.DataFrame) -> float:

@@ -1,0 +1,36 @@
+# Macro calendar: scheduled events that move crypto. The bot pauses NEW entries inside each
+# event's window (open trades keep their stops) and flags the window in the daily report.
+#
+# Times are local to `tz` (default America/New_York), so daylight saving is handled.
+# Windows default by kind (minutes before / after): fomc 60/120, cpi 30/90, unlock 120/240,
+# other 30/60. Override per event with before_minutes / after_minutes.
+#
+# KEEP THIS UP TO DATE. The bot warns in the daily report when fewer than 45 days of events
+# are left. Sources:
+#   FOMC: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm (decision 2:00 pm ET,
+#         second day of each meeting; dates are tentative until the meeting before confirms them)
+#   CPI:  https://www.bls.gov/schedule/ (8:30 am ET). 2027 CPI dates were not yet confirmed
+#         when this file was written: add them once BLS publishes its 2027 schedule.
+#   Token unlocks: add large ones for the coins you trade by hand, with `symbols: [SOL]`.
+
+timezone: America/New_York
+
+events:
+  # --- FOMC decisions -------------------------------------------------------------------------
+  - {name: FOMC decision, kind: fomc, time: "2026-10-28 14:00"}
+  - {name: FOMC decision, kind: fomc, time: "2026-12-09 14:00"}
+  - {name: FOMC decision, kind: fomc, time: "2027-01-27 14:00"}
+  - {name: FOMC decision, kind: fomc, time: "2027-03-17 14:00"}
+  - {name: FOMC decision, kind: fomc, time: "2027-04-28 14:00"}
+  - {name: FOMC decision, kind: fomc, time: "2027-06-09 14:00"}
+  - {name: FOMC decision, kind: fomc, time: "2027-07-28 14:00"}
+  - {name: FOMC decision, kind: fomc, time: "2027-09-15 14:00"}
+  - {name: FOMC decision, kind: fomc, time: "2027-10-27 14:00"}
+  - {name: FOMC decision, kind: fomc, time: "2027-12-08 14:00"}
+
+  # --- US CPI releases ------------------------------------------------------------------------
+  - {name: US CPI (October data), kind: cpi, time: "2026-11-10 08:30"}
+  - {name: US CPI (November data), kind: cpi, time: "2026-12-10 08:30"}
+
+  # --- Token unlocks (examples of the format; add real ones) ---------------------------------
+  # - {name: SOL unlock, kind: unlock, time: "2027-01-15 00:00", tz: UTC, symbols: [SOL]}

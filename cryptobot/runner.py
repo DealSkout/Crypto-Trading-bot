@@ -38,9 +38,29 @@ class Runner:
         sleep: Callable[[float], None] = time.sleep,
         flatten_on_exit: bool = True,
         guardian=None,
+        research=None,
+        regimes=None,
+        registry=None,
+        shadows=None,
     ) -> None:
         self.cfg = cfg
         self.guardian = guardian
+        self.research = research
+        self.regimes = regimes
+        self.registry = registry
+        self.shadows = shadows
+        # automatic pauses of new entries (risk.pause_on_macro / pause_on_stale_data)
+        self.stale_prices: dict[str, str] = {}
+        self.active_pauses: dict[str, str] = {}
+        self.calendar = None
+        if cfg.risk.pause_on_macro:
+            if research is not None:
+                self.calendar = research.calendar
+            else:
+                from cryptobot.research.calendar import MacroCalendar
+
+                self.calendar = MacroCalendar.load(cfg.research.calendar_file)
+        engine.pauses.append(self.pause_reason)
         self.mode = mode
         self.engine = engine
         self.fetch_bars = fetch_bars
@@ -92,6 +112,7 @@ class Runner:
                 " `python -m cryptobot resume` after reviewing."
             )
             return
+        self.reconcile_on_start()
         if self.guardian is not None:  # the starting equity is the first peak
             self.guardian.check_equity(self.engine.equity(), self.clock())
         self.say(
@@ -129,7 +150,83 @@ class Runner:
         finally:
             self.shutdown()
 
+    # ------------------------------------------------------------------ pauses
+    def pause_reason(self, symbol: str, ts: datetime) -> str | None:
+        """Why new entries are paused for `symbol` right now, or None."""
+        when = self.clock()
+        if self.calendar is not None:
+            ev = self.calendar.active(when, symbol)
+            if ev is not None:
+                start, end = ev.window
+                return f"macro window {ev.name} ({start:%H:%M}-{end:%H:%M} UTC)"
+        if self.cfg.risk.pause_on_stale_data:
+            if symbol in self.stale_prices:
+                return self.stale_prices[symbol]
+            if self.research is not None and self.cfg.research.required_sources:
+                stale = self.research.stale_sources(when)
+                if stale:
+                    return f"research feed stale: {', '.join(stale)}"
+        return None
+
+    def track_pauses(self, now: datetime) -> None:
+        """Journal and announce each pause when it starts and ends (risk events)."""
+        for symbol in self.cfg.symbols:
+            reason = self.pause_reason(symbol, now)
+            before = self.active_pauses.get(symbol)
+            if reason and not before:
+                self.active_pauses[symbol] = reason
+                self.journal.log("pause_start", reason, symbol=symbol, ts=now)
+                self.say(f"PAUSE {symbol}: no new entries ({reason})")
+            elif before and not reason:
+                del self.active_pauses[symbol]
+                self.journal.log("pause_end", before, symbol=symbol, ts=now)
+                self.say(f"RESUMED {symbol}: entries allowed again (was: {before})")
+            elif reason and before != reason:
+                self.active_pauses[symbol] = reason
+
+    def check_stale(self, symbol: str, completed: pd.DataFrame, now: datetime) -> None:
+        tf = timedelta(minutes=self.cfg.timeframe_minutes)
+        limit = tf * self.cfg.risk.stale_bars
+        last_end = completed.index[-1].to_pydatetime() + tf if len(completed) else None
+        if last_end is None or now - last_end > limit:
+            age = "no bars" if last_end is None else f"last bar ended {last_end:%H:%M} UTC"
+            self.stale_prices[symbol] = f"price data stale ({age})"
+        else:
+            self.stale_prices.pop(symbol, None)
+
+    def reconcile_on_start(self) -> None:
+        """The bot day-trades and always starts flat. A position or order already at the
+        broker means the last run died without flattening (a backup stop may still be resting
+        there): cancel and close it all, and say so."""
+        broker = self.engine.broker
+        if broker.name == "paper":
+            return
+        try:
+            positions, orders = broker.get_positions(), broker.open_orders()
+        except BrokerError as e:
+            self.journal.log("error", f"startup reconcile could not read the account: {e}")
+            return
+        if not positions and not orders:
+            return
+        held = ", ".join(f"{p.symbol} {p.qty:g}" for p in positions) or "none"
+        try:
+            broker.flatten_all()
+        except BrokerError as e:
+            self.journal.log("error", f"startup flatten failed: {e}")
+            if self.mode == "live":
+                raise
+        self.journal.log(
+            "startup_flatten",
+            f"left over from the last run: positions {held}; {len(orders)} open order(s)",
+        )
+        self.say(
+            f"Startup: found positions ({held}) and {len(orders)} open order(s) left over from"
+            " the last run. Cancelled and flattened them; the bot starts flat."
+        )
+
     def shutdown(self) -> None:
+        if self.research is not None:
+            self.research.stop()
         if self.flatten_on_exit and self.engine.open:
             try:
                 self.engine._flatten("shutdown", self.clock())
@@ -153,9 +250,8 @@ class Runner:
                 continue
             active = True
             bars = self.fetch_bars(symbol)
-            if bars.empty:
-                continue
-            completed = bars[(bars.index + tf) <= now]
+            completed = bars[(bars.index + tf) <= now] if not bars.empty else bars
+            self.check_stale(symbol, completed, now)
             if completed.empty:
                 continue
             last = completed.index[-1]
@@ -164,10 +260,18 @@ class Runner:
                 n = HISTORY_SESSIONS * (market.session_minutes // self.cfg.timeframe_minutes)
                 window = completed.tail(n)
                 window.attrs = dict(bars.attrs)
+                if self.regimes is not None:  # breadth needs every market's completed days
+                    self.regimes.update_from_bars(symbol, window)
                 self.engine.on_bar(symbol, window)
+                if self.shadows is not None:
+                    self.shadows.on_bar(symbol, window)
             else:
-                self.engine.on_tick(symbol, float(bars["close"].iloc[-1]), now)
+                price = float(bars["close"].iloc[-1])
+                self.engine.on_tick(symbol, price, now)
+                if self.shadows is not None:
+                    self.shadows.on_tick(symbol, price, now)
         self.check_day_rollover(now)
+        self.track_pauses(now)
         try:
             self.journal.set_state(
                 "heartbeat",
@@ -201,6 +305,87 @@ class Runner:
             if outcome.get("stopped"):
                 self.guardian_stop((self.guardian.stop_info() or {}).get("reason", ""))
         self.run_trade_coach(day)
+        self.run_digest(day, now)
+        self.run_shadows(now)
+        self.apply_champion()
+        self.export_store()
+        self.daily_report(day)
+
+    def daily_report(self, day) -> None:
+        """The day's report: file, Telegram, email. Never allowed to break the loop."""
+        if self.mode == "backtest":
+            return
+        try:
+            from cryptobot.daily_report import build_report, write_and_send
+
+            rep = build_report(
+                self.cfg, self.engine.journal, day, self.registry, self.research, self.regimes
+            )
+            write_and_send(self.cfg, rep, self.notifier)
+        except Exception as e:  # pragma: no cover - reporting must never stop trading
+            log.warning("daily report failed: %s", e)
+
+    def run_digest(self, day, now: datetime) -> dict | None:
+        """The day's research digest (at most one LLM call). Never allowed to break the loop."""
+        if self.research is None or self.mode == "backtest":
+            return None
+        try:
+            from cryptobot.research.digest import make_digest_llm, run_daily_digest
+
+            llm = make_digest_llm(self.cfg) if self.cfg.research.digest else None
+            regimes = self.regimes.current(now.date()) if self.regimes is not None else None
+            return run_daily_digest(
+                self.cfg,
+                self.engine.journal,
+                self.research,
+                day,
+                llm=llm,
+                now=now,
+                regimes=regimes,
+            )
+        except Exception as e:  # pragma: no cover - research must never stop trading
+            log.warning("research digest failed: %s", e)
+            return None
+
+    def run_shadows(self, now: datetime) -> None:
+        """Judge shadow runs that have run long enough (paper promotion only)."""
+        if self.shadows is None:
+            return
+        try:
+            for version, verdict, reason in self.shadows.evaluate(now):
+                if verdict != "wait":
+                    word = "PROMOTED to paper champion" if verdict == "promote" else "rejected"
+                    self.say(f"Shadow {version} {word}: {reason}")
+            self.shadows.sync()
+        except Exception as e:  # pragma: no cover - learning must never stop trading
+            log.warning("shadow evaluation failed: %s", e)
+
+    def apply_champion(self) -> None:
+        """Paper only: if the registry's champion changed (shadow promotion or a human
+        rollback), trade it from now on. Only between trades."""
+        if self.registry is None or self.mode != "paper" or self.engine.open:
+            return
+        try:
+            from cryptobot.strategies import load_strategy
+
+            champ = self.registry.champion()
+            if champ is None or champ.id == self.engine.version:
+                return
+            self.engine.set_model(
+                load_strategy(champ.strategy), champ.params, champ.filters, champ.id
+            )
+            self.say(f"Paper bot now trades {champ.describe()} ({champ.reason})")
+        except Exception as e:  # pragma: no cover
+            log.warning("champion switch failed: %s", e)
+
+    def export_store(self) -> None:
+        """Refresh the Parquet copy of the feature store. Never allowed to break the loop."""
+        try:
+            from cryptobot.store import export_store
+
+            export_store(self.engine.journal, self.cfg.store_dir)
+        except Exception as e:  # pragma: no cover - bookkeeping only
+            log.warning("feature store export failed: %s", e)
 
     def run_trade_coach(self, day) -> None:
         """The daily trade review, after the close. Never allowed to break the loop."""

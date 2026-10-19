@@ -12,10 +12,22 @@ from __future__ import annotations
 import pandas as pd
 
 from cryptobot.strategies import Signal
-from cryptobot.strategies.common import bar_minutes, daily_atr, today_bars
+from cryptobot.strategies.common import bar_minutes, daily_atr, minute_of_day, today_bars
 
 DEFAULT_PARAMS = {"range_minutes": 5, "target_r": 10, "atr_floor_mult": 0.1, "atr_days": 14}
 PARAM_GRID = {"range_minutes": [5, 15, 30], "target_r": [3, 10]}
+
+
+DUE_WINDOW_MINUTES = 60  # how long after the range end a late first bar may still fire
+
+
+def due(symbol: str, start, tf: int, params: dict) -> bool:
+    """Cheap pre-check for the engine: only bars that end at or after the range end, within
+    an hour of it, can be the first completed bar past the boundary. (A first bar more than
+    an hour late is no longer an opening-range breakout.)"""
+    range_end = float({**DEFAULT_PARAMS, **(params or {})}["range_minutes"])
+    end = minute_of_day(start) + tf
+    return range_end <= end < range_end + tf + DUE_WINDOW_MINUTES
 
 
 def signal(bars: pd.DataFrame, params: dict) -> Signal | None:

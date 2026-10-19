@@ -29,7 +29,46 @@ CREATE TABLE IF NOT EXISTS coach_notes (id INTEGER PRIMARY KEY, ts TEXT, note TE
 CREATE TABLE IF NOT EXISTS llm_spend (date TEXT, component TEXT, usd REAL,
   PRIMARY KEY (date, component));
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT, ts TEXT);
+CREATE TABLE IF NOT EXISTS decisions (
+  id INTEGER PRIMARY KEY, ts TEXT NOT NULL, mode TEXT, version TEXT, strategy TEXT,
+  symbol TEXT, action TEXT, reason TEXT, side TEXT, signal_price REAL, stop REAL, target REAL,
+  qty REAL, fill_price REAL, slippage_bps REAL, fees REAL, pnl REAL, regime TEXT, params TEXT,
+  features TEXT, inputs_hash TEXT, trade_id INTEGER);
+CREATE INDEX IF NOT EXISTS decisions_ts ON decisions (ts);
 """
+
+# Columns added to `trades` after the first release: added in place on old journals.
+TRADE_EXTRA_COLUMNS = {
+    "version": "TEXT",
+    "regime": "TEXT",
+    "signal_price": "REAL",
+    "entry_slippage_bps": "REAL",
+    "exit_slippage_bps": "REAL",
+    "fees": "REAL",
+    "features": "TEXT",
+}
+
+DECISION_FIELDS = (
+    "version",
+    "strategy",
+    "symbol",
+    "action",
+    "reason",
+    "side",
+    "signal_price",
+    "stop",
+    "target",
+    "qty",
+    "fill_price",
+    "slippage_bps",
+    "fees",
+    "pnl",
+    "regime",
+    "params",
+    "features",
+    "inputs_hash",
+    "trade_id",
+)
 
 
 def _iso(ts: datetime | None) -> str:
@@ -43,6 +82,10 @@ class Journal:
         self.mode = mode
         self.conn = sqlite3.connect(path, timeout=10)
         self.conn.executescript(SCHEMA)
+        have = {r[1] for r in self.conn.execute("PRAGMA table_info(trades)")}
+        for name, kind in TRADE_EXTRA_COLUMNS.items():
+            if name not in have:
+                self.conn.execute(f"ALTER TABLE trades ADD COLUMN {name} {kind}")
         self.conn.commit()
 
     def close(self) -> None:
@@ -78,11 +121,12 @@ class Journal:
         return pd.read_sql_query(q, self.conn, params=args)
 
     # trades ------------------------------------------------------------------------
-    def record_trade(self, t: dict[str, Any], strategy: str = "") -> None:
-        self.conn.execute(
+    def record_trade(self, t: dict[str, Any], strategy: str = "") -> int:
+        cur = self.conn.execute(
             "INSERT INTO trades (mode, strategy, symbol, side, qty, entry_ts, entry_price, exit_ts,"
             " exit_price, stop, target, pnl, r_multiple, costs, exit_reason, signal_reason,"
-            " asset_class) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " asset_class, version, regime, signal_price, entry_slippage_bps, exit_slippage_bps,"
+            " fees, features) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 self.mode,
                 strategy,
@@ -101,9 +145,58 @@ class Journal:
                 t.get("exit_reason", ""),
                 t.get("signal_reason", ""),
                 t.get("asset_class", "crypto"),
+                t.get("version"),
+                t.get("regime"),
+                t.get("signal_price"),
+                t.get("entry_slippage_bps"),
+                t.get("exit_slippage_bps"),
+                t.get("fees"),
+                t.get("features"),
             ),
         )
         self.conn.commit()
+        return int(cur.lastrowid)
+
+    # decisions (the feature store) ------------------------------------------------------
+    def record_decision(self, ts: datetime | None, **fields: Any) -> int:
+        """One row per decision: a signal taken (enter), refused (skip) or closed (exit), with
+        the features the bot knew at that moment."""
+        unknown = set(fields) - set(DECISION_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown decision fields {sorted(unknown)}")
+        row = {k: fields.get(k) for k in DECISION_FIELDS}
+        for k in ("params", "features"):
+            if row[k] is not None and not isinstance(row[k], str):
+                row[k] = json.dumps(row[k], sort_keys=True, default=str)
+        cur = self.conn.execute(
+            f"INSERT INTO decisions (ts, mode, {', '.join(DECISION_FIELDS)}) VALUES"
+            f" ({','.join('?' * (len(DECISION_FIELDS) + 2))})",
+            (_iso(ts), self.mode, *row.values()),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def decisions(
+        self,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        mode: str | None = None,
+        actions: list[str] | None = None,
+    ) -> pd.DataFrame:
+        q, args = "SELECT * FROM decisions WHERE 1=1", []
+        if since is not None:
+            q += " AND ts >= ?"
+            args.append(_iso(since))
+        if until is not None:
+            q += " AND ts < ?"
+            args.append(_iso(until))
+        if mode:
+            q += " AND mode = ?"
+            args.append(mode)
+        if actions:
+            q += f" AND action IN ({','.join('?' * len(actions))})"
+            args.extend(actions)
+        return pd.read_sql_query(q + " ORDER BY id", self.conn, params=args)
 
     def trades(self, since: datetime | None = None, mode: str | None = None) -> pd.DataFrame:
         q, args = "SELECT * FROM trades WHERE 1=1", []

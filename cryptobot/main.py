@@ -1,5 +1,6 @@
 """Command line: backtest | paper | live | report | coach | refit | check | review | account |
-dashboard | guardian | resume | mcp."""
+dashboard | guardian | resume | mcp | export | replay | research |
+regimes | learn | models | rollback | approve-live | revoke-live | baseline | daily-report."""
 
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pandas as pd
 from dotenv import load_dotenv
 
 from cryptobot import __version__, learn, report
@@ -206,8 +208,12 @@ def run_loop(cfg: Config, mode: str, args: argparse.Namespace) -> int:
     from cryptobot.runner import Runner
 
     setup_logging(args.verbose, logfile=f"cryptobot_{mode}.log")
-    module = load_strategy(cfg.strategy)
-    params = {**default_params(module), **cfg.params}
+    from cryptobot.registry import Registry
+
+    registry = Registry(cfg.journal_path)
+    model = trading_model(cfg, mode, registry)
+    module = load_strategy(model.strategy)
+    params = dict(model.params)
     journal = Journal(cfg.journal_path, mode=mode)
     notifier = make_notifier(cfg)
     broker = make_broker(cfg, mode)
@@ -223,12 +229,16 @@ def run_loop(cfg: Config, mode: str, args: argparse.Namespace) -> int:
     engine = Engine(
         cfg, module, params, broker, risk, journal, mode=mode, notifier=notifier, decider=decider
     )
+    engine.version = model.id
+    engine.filters = dict(model.filters)
     provider = args.data or cfg.data.provider
 
+    from cryptobot.backtest import HISTORY_SESSIONS
+
     def fetch(symbol: str):
-        return get_bars(
-            cfg, symbol, provider=provider, lookback_days=min(cfg.data.lookback_days, 10)
-        )
+        # the same history a backtest strategy sees (ATR etc. need it); incremental after the
+        # first call, so polling stays cheap
+        return get_bars(cfg, symbol, provider=provider, lookback_days=HISTORY_SESSIONS + 2)
 
     from cryptobot.guardian import make_guardian
 
@@ -241,14 +251,69 @@ def run_loop(cfg: Config, mode: str, args: argparse.Namespace) -> int:
             "Review the dashboard and journal, then run `python -m cryptobot resume`."
         )
         return 4
-    runner = Runner(cfg, mode, engine, fetch, journal, notifier, guardian=guardian)
+    from cryptobot.regime import RegimeDetector
+
+    research = None
+    regimes = RegimeDetector(cfg.regime, cfg.symbols)
+    engine.context_providers.append(regimes.context)
+    if cfg.research.enabled:
+        from cryptobot.research.feed import ResearchFeed
+        from cryptobot.research.store import ResearchStore
+
+        research = ResearchFeed(cfg, ResearchStore(cfg.journal_path))
+        research.start()  # background thread; never blocks or breaks the trading loop
+        engine.context_providers.append(research.context)
+        store = research.store
+
+        def fear_greed(when):
+            row = store.asof("fear_greed", "index", when)
+            return row["value"] if row else None
+
+        regimes.fear_greed = fear_greed
+    shadows = None
+    if mode == "paper":  # shadow runs never happen next to live money
+        from cryptobot.learning import ShadowRunner
+
+        shadows = ShadowRunner(cfg, registry, cfg.journal_path, engine.context_providers)
+        shadows.sync()
+    runner = Runner(
+        cfg,
+        mode,
+        engine,
+        fetch,
+        journal,
+        notifier,
+        guardian=guardian,
+        research=research,
+        regimes=regimes,
+        registry=registry,
+        shadows=shadows,
+    )
     runner.install_signal_handlers()
     print(
-        f"{mode} mode: broker={broker.name} strategy={cfg.strategy} params={params}"
+        f"{mode} mode: broker={broker.name} model={model.id} strategy={model.strategy}"
+        f" params={params} filters={model.filters or 'none'}"
         f" symbols={cfg.symbols} data={provider}. Ctrl-C to stop (flattens first)."
     )
     runner.run_forever()
     return 0
+
+
+def trading_model(cfg: Config, mode: str, registry):
+    """Which model trades. Paper: the registry's champion (config.yaml is registered first, and
+    a human edit of it becomes the champion). Live: ONLY a version a human approved with
+    `approve-live`; without one, the human-set config.yaml strategy and params."""
+    from cryptobot.registry import Model
+
+    module = load_strategy(cfg.strategy)
+    config_params = {**default_params(module), **cfg.params}
+    if mode == "paper":
+        registry.sync_with_config(cfg.strategy, config_params)
+        return registry.champion()
+    approved = registry.live_version()
+    if approved is not None:
+        return approved
+    return Model(id="config", strategy=cfg.strategy, params=config_params)
 
 
 def cmd_paper(cfg: Config, args: argparse.Namespace) -> int:
@@ -298,7 +363,9 @@ def cmd_check(cfg: Config, args: argparse.Namespace) -> int:
 def cmd_refit(cfg: Config, args: argparse.Namespace) -> int:
     bars = load_bars(cfg, args.data, args.days)
     journal = Journal(cfg.journal_path, mode="paper")
-    out = learn.refit(cfg, bars, journal, apply=not args.no_apply)
+    # report only unless a human asks with --apply (the weekly `learn` loop is the automated
+    # path, and it goes through the full gate and a shadow run)
+    out = learn.refit(cfg, bars, journal, apply=args.apply)
     print(f"refit: changed={out['changed']} reason={out.get('reason')} params={out['params']}")
     if out.get("challenger"):
         c, ch = out["champion"], out["challenger"]
@@ -563,8 +630,8 @@ def build_parser() -> argparse.ArgumentParser:
     ch.add_argument("--dry-run", action="store_true", help="never apply anything")
     ch.add_argument("--provider", choices=["claude", "ollama"], default=None)
     add_data(ch)
-    rf = sub.add_parser("refit", help="walk-forward re-fit of params through the gate")
-    rf.add_argument("--no-apply", action="store_true")
+    rf = sub.add_parser("refit", help="legacy quick re-fit of params (reports only by default)")
+    rf.add_argument("--apply", action="store_true", help="write passing params to config.yaml")
     add_data(rf)
     sub.add_parser("check", help="show whether Rule 6 would allow going live")
     gd = sub.add_parser("guardian", help="run the watchdog review now; it may stop the bot")
@@ -595,7 +662,286 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mc.add_argument("--mode", choices=["paper", "live"], default=None, help="which journal")
     mc.add_argument("--read-only", action="store_true", help="leave out the stop_bot tool")
+    rs2 = sub.add_parser("research", help="the market research feed: status, refresh, digest")
+    rs2.add_argument("--refresh", action="store_true", help="refresh every source now")
+    rs2.add_argument("--backfill", action="store_true", help="pull history (for backtests)")
+    rs2.add_argument("--days", type=int, default=None, help="backfill depth in days")
+    rs2.add_argument("--digest", action="store_true", help="build today's digest now")
+    rs2.add_argument("--force", action="store_true", help="rebuild the digest if it exists")
+    rs2.add_argument("--no-ai", action="store_true", help="digest from the numbers only")
+    rg = sub.add_parser("regimes", help="today's regime per market and results per regime")
+    add_data(rg)
+    bl = sub.add_parser("baseline", help="baseline metrics: backtests + paper results, saved")
+    add_data(bl)
+    dr = sub.add_parser("daily-report", help="build (and send) the daily report for a UTC day")
+    dr.add_argument("--date", default=None, help="YYYY-MM-DD (default: yesterday, UTC)")
+    dr.add_argument("--mode", choices=["paper", "live"], default=None)
+    dr.add_argument("--no-send", action="store_true", help="write the file only")
+    le = sub.add_parser("learn", help="weekly self-learning run: challengers, gate, shadow start")
+    le.add_argument("--dry-run", action="store_true", help="report only; registry unchanged")
+    le.add_argument("--workers", type=int, default=None)
+    add_data(le)
+    sub.add_parser("models", help="list the model registry (versions, status, reasons)")
+    rb = sub.add_parser("rollback", help="make an earlier version the paper champion again")
+    rb.add_argument("version")
+    rb.add_argument("--live", action="store_true", help="roll the LIVE version back instead")
+    al = sub.add_parser("approve-live", help="HUMAN ONLY: approve a version for live trading")
+    al.add_argument("version")
+    al.add_argument("--i-approve", action="store_true", help="required: you approve real money")
+    sub.add_parser("revoke-live", help="withdraw the live approval (live falls back to config)")
+    ex = sub.add_parser("export", help="write the journal's decisions and trades to Parquet")
+    ex.add_argument("--out", default="store", help="output folder (default: store)")
+    ex.add_argument("--mode", choices=["paper", "live", "backtest"], default=None)
+    rr = sub.add_parser("replay", help="re-run a past day's decisions from stored bars and compare")
+    rr.add_argument("--date", required=True, help="YYYY-MM-DD (UTC)")
+    rr.add_argument("--mode", choices=["paper", "live"], default=None)
+    add_data(rr)
     return p
+
+
+def cmd_research(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.research.digest import make_digest_llm, run_daily_digest
+    from cryptobot.research.feed import ResearchFeed
+    from cryptobot.research.store import ResearchStore
+
+    feed = ResearchFeed(cfg, ResearchStore(cfg.journal_path))
+    if args.backfill:
+        for source, result in feed.backfill(args.days).items():
+            print(f"backfill {source}: {result}")
+    elif args.refresh:
+        for source, result in feed.refresh(force=True).items():
+            print(f"refresh {source}: {result}")
+    if args.digest:
+        now = datetime.now(UTC)
+        llm = None if args.no_ai else make_digest_llm(cfg)
+        journal = Journal(cfg.journal_path, mode=cfg.mode)
+        out = run_daily_digest(cfg, journal, feed, now.date(), llm=llm, now=now, force=args.force)
+        d = out.get("digest", out)
+        print(f"digest ({out.get('source', out['status'])}): risk {d.get('risk_level')}")
+        print(d.get("summary", ""))
+    now = datetime.now(UTC)
+    print("source          last ok (UTC)      age")
+    ages = feed.staleness_minutes(now)
+    status = feed.store.status()
+    for source, age in ages.items():
+        info = status.get(source) or {}
+        last = (info.get("last_ok") or "never")[:16]
+        err = f"  last error: {info['last_error'][:80]}" if info.get("last_error") else ""
+        age_txt = "-" if age is None else f"{age:.0f} min"
+        print(f"{source:<15} {last:<18} {age_txt}{err}")
+    cover = feed.calendar.days_of_cover(now)
+    print(f"macro calendar: {len(feed.calendar.events)} events, {cover:.0f} days of cover")
+    if cover < cfg.research.calendar_warn_days:
+        print(f"  WARNING: add upcoming events to {cfg.research.calendar_file}")
+    return 0
+
+
+def cmd_regimes(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.regime import RegimeDetector, regime_performance
+
+    bars = load_bars(cfg, args.data, args.days or 60)
+    det = RegimeDetector.from_bars(cfg.regime, bars)
+    today = datetime.now(UTC).date()
+    print(f"Regimes for {today} (UTC), from completed days only:")
+    for symbol in cfg.symbols:
+        info = det.classify(symbol, today)
+        detail = ", ".join(
+            f"{k.removeprefix('regime_')} {v:.2f}"
+            for k, v in info.items()
+            if k != "regime" and isinstance(v, float)
+        )
+        print(f"  {symbol:<9} {info['regime']:<9} {detail}")
+    journal = Journal(cfg.journal_path, mode=cfg.mode)
+    perf = regime_performance(journal.trades(mode=cfg.mode), by=["strategy"])
+    print(f"\n{cfg.mode} results by strategy and regime:")
+    print("  (no trades yet)" if perf.empty else perf.to_string(index=False))
+    result = latest_result(cfg)
+    if result is not None and result.regime_table:
+        print(f"\nlatest {result.strategy} backtest, out of sample, by regime:")
+        print(pd.DataFrame(result.regime_table).to_string(index=False))
+    return 0
+
+
+def cmd_baseline(cfg: Config, args: argparse.Namespace) -> int:
+    """Step 0 baseline on real data: every strategy's out-of-sample backtest after fees, and
+    the paper journal so far. Saved to reports/baseline.json for the daily report."""
+    from cryptobot.daily_report import METRIC_ROWS, _fmt, journal_metrics
+
+    bars = load_bars(cfg, args.data, args.days)
+    names = sorted({cfg.strategy, *cfg.learning.strategies})
+    out: dict = {
+        "created": datetime.now(UTC).isoformat(),
+        "data": args.data or cfg.data.provider,
+        "days": int(len({d for b in bars.values() for d in b.index.date})),
+        "symbols": cfg.symbols,
+        "backtests": {},
+    }
+    for name in names:
+        params = cfg.params if name == cfg.strategy else {}
+        r = run_backtest(cfg, bars, strategy=name, params=params)
+        out["backtests"][name] = {**r.metrics, "buy_and_hold": r.benchmarks["buy_and_hold"]}
+        r.save(cfg.reports_dir)
+    journal = Journal(cfg.journal_path, mode=cfg.mode)
+    first = journal.daily()
+    if len(first):
+        since = date_from(first["date"].iloc[0])
+        out["paper"] = journal_metrics(journal, cfg.mode, since, datetime.now(UTC).date())
+    path = Path(cfg.reports_dir) / "baseline.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out, indent=2, default=str))
+    cols = list(out["backtests"]) + (["paper so far"] if "paper" in out else [])
+    data = list(out["backtests"].values()) + ([out["paper"]] if "paper" in out else [])
+    print(f"Baseline over {out['days']} days of {out['data']} data, out of sample, after costs")
+    print(f"{'':<24}" + "".join(f"{c:>18}" for c in cols))
+    for label, key, fmt in METRIC_ROWS:
+        print(f"{label:<24}" + "".join(f"{_fmt(fmt, d.get(key)):>18}" for d in data))
+    print(f"saved {path}")
+    return 0
+
+
+def date_from(text: str):
+    from datetime import date as date_cls
+
+    return date_cls.fromisoformat(str(text)[:10])
+
+
+def cmd_daily_report(cfg: Config, args: argparse.Namespace) -> int:
+    from datetime import timedelta
+
+    from cryptobot.daily_report import build_report, write_and_send
+    from cryptobot.notify import make_notifier
+    from cryptobot.regime import RegimeDetector
+    from cryptobot.registry import Registry
+
+    day = date_from(args.date) if args.date else datetime.now(UTC).date() - timedelta(days=1)
+    mode = args.mode or cfg.mode
+    journal = Journal(cfg.journal_path, mode=mode)
+    research = None
+    if cfg.research.enabled:
+        from cryptobot.research.feed import ResearchFeed
+        from cryptobot.research.store import ResearchStore
+
+        research = ResearchFeed(cfg, ResearchStore(cfg.journal_path))
+    regimes = None
+    try:
+        regimes = RegimeDetector.from_bars(cfg.regime, load_bars(cfg, None, 40))
+    except DataError as e:
+        print(f"regimes unavailable: {e}")
+    rep = build_report(cfg, journal, day, Registry(cfg.journal_path), research, regimes)
+    path = write_and_send(
+        cfg, rep, None if args.no_send else make_notifier(cfg), email=not args.no_send
+    )
+    print(path.read_text())
+    return 0
+
+
+def cmd_learn(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.learning import run_learning
+    from cryptobot.registry import Registry
+
+    bars = load_bars(cfg, args.data, args.days)
+    registry = Registry(cfg.journal_path)
+    module = load_strategy(cfg.strategy)
+    registry.sync_with_config(cfg.strategy, {**default_params(module), **cfg.params})
+    research = cfg.journal_path if Path(cfg.journal_path).exists() else None
+    report = run_learning(
+        cfg, bars, registry, research_path=research, dry_run=args.dry_run, workers=args.workers
+    )
+    print(f"champion: {report['champion']}")
+    print(f"challengers tried: {len(report['challengers'])}; best: {report.get('best', 'none')}")
+    print(
+        f"verdict: {'ACCEPTED' if report['accepted'] else 'rejected'}; action: {report['action']}"
+    )
+    for r in report["reasons"]:
+        print(f"  - {r}")
+    print(f"report: {Path(cfg.reports_dir) / 'learning'}")
+    return 0
+
+
+def cmd_models(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.registry import Registry
+
+    reg = Registry(cfg.journal_path)
+    live = reg.live_version()
+    print(f"{'ver':<5} {'status':<10} {'live':<5} model / reason")
+    for m in reg.all():
+        flag = "LIVE" if live is not None and live.id == m.id else ""
+        print(f"{m.id:<5} {m.status:<10} {flag:<5} {m.describe().split(' ', 1)[1]}")
+        if m.reason:
+            print(f"{'':<22}{m.reason[:110]}")
+    return 0
+
+
+def cmd_rollback(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.registry import Registry, RegistryError
+
+    reg = Registry(cfg.journal_path)
+    try:
+        if args.live:
+            m = reg.approve_live(args.version, who="human (rollback)")
+            print(f"live now uses {m.describe()} (restart the live service to apply)")
+        else:
+            m = reg.rollback(args.version)
+            print(f"paper champion is now {m.describe()} (applied at the next UTC day or restart)")
+    except RegistryError as e:
+        print(f"rollback refused: {e}")
+        return 1
+    return 0
+
+
+def cmd_approve_live(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.registry import Registry, RegistryError
+
+    if not args.i_approve:
+        print("refusing: add --i-approve to confirm you approve this version for real money")
+        return 2
+    reg = Registry(cfg.journal_path)
+    try:
+        m = reg.approve_live(args.version, who=os.environ.get("USER", "human"))
+    except RegistryError as e:
+        print(f"refused: {e}")
+        return 1
+    print(f"approved for live: {m.describe()}")
+    print("Live trading still needs mode: live, CRYPTOBOT_LIVE_CONFIRM=yes and the Rule 6 gate.")
+    return 0
+
+
+def cmd_revoke_live(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.registry import Registry
+
+    Registry(cfg.journal_path).revoke_live(who=os.environ.get("USER", "human"))
+    print("live approval withdrawn: live mode falls back to config.yaml's strategy and params")
+    return 0
+
+
+def cmd_export(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.store import export_store
+
+    journal = Journal(cfg.journal_path, mode=args.mode or cfg.mode)
+    for name, path in export_store(journal, args.out).items():
+        print(f"{name}: {path}")
+    return 0
+
+
+def cmd_replay(cfg: Config, args: argparse.Namespace) -> int:
+    from datetime import date as date_cls
+
+    from cryptobot.store import replay_day
+
+    day = date_cls.fromisoformat(args.date)
+    days_back = (datetime.now(UTC).date() - day).days + 30
+    bars = load_bars(cfg, args.data, days_back)
+    journal = Journal(cfg.journal_path, mode=args.mode or cfg.mode)
+    rows = replay_day(cfg, journal, day, bars, mode=args.mode or cfg.mode)
+    if not rows:
+        print(f"no enter/skip decisions journalled on {day}")
+        return 0
+    exact = sum(1 for r in rows if r.get("status") == "exact")
+    for r in rows:
+        extra = f" diffs={r['feature_diffs']}" if r.get("feature_diffs") else ""
+        print(f"{r['ts'][:16]} {r['symbol']:<9} {r['action']:<5} {r['status']}{extra}")
+    print(f"{exact} of {len(rows)} decisions replayed exactly")
+    return 0 if all(r.get("status") != "MISMATCH" for r in rows) else 1
 
 
 COMMANDS = {
@@ -612,6 +958,17 @@ COMMANDS = {
     "review": cmd_review,
     "mcp": cmd_mcp,
     "account": cmd_account,
+    "export": cmd_export,
+    "research": cmd_research,
+    "regimes": cmd_regimes,
+    "learn": cmd_learn,
+    "baseline": cmd_baseline,
+    "daily-report": cmd_daily_report,
+    "models": cmd_models,
+    "rollback": cmd_rollback,
+    "approve-live": cmd_approve_live,
+    "revoke-live": cmd_revoke_live,
+    "replay": cmd_replay,
 }
 
 
