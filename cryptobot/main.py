@@ -1,5 +1,5 @@
 """Command line: backtest | paper | live | report | coach | refit | check | review | account |
-dashboard | guardian | resume | mcp | export | replay | research."""
+dashboard | guardian | resume | mcp | export | replay | research | regimes."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pandas as pd
 from dotenv import load_dotenv
 
 from cryptobot import __version__, learn, report
@@ -243,7 +244,11 @@ def run_loop(cfg: Config, mode: str, args: argparse.Namespace) -> int:
             "Review the dashboard and journal, then run `python -m cryptobot resume`."
         )
         return 4
+    from cryptobot.regime import RegimeDetector
+
     research = None
+    regimes = RegimeDetector(cfg.regime, cfg.symbols)
+    engine.context_providers.append(regimes.context)
     if cfg.research.enabled:
         from cryptobot.research.feed import ResearchFeed
         from cryptobot.research.store import ResearchStore
@@ -251,8 +256,23 @@ def run_loop(cfg: Config, mode: str, args: argparse.Namespace) -> int:
         research = ResearchFeed(cfg, ResearchStore(cfg.journal_path))
         research.start()  # background thread; never blocks or breaks the trading loop
         engine.context_providers.append(research.context)
+        store = research.store
+
+        def fear_greed(when):
+            row = store.asof("fear_greed", "index", when)
+            return row["value"] if row else None
+
+        regimes.fear_greed = fear_greed
     runner = Runner(
-        cfg, mode, engine, fetch, journal, notifier, guardian=guardian, research=research
+        cfg,
+        mode,
+        engine,
+        fetch,
+        journal,
+        notifier,
+        guardian=guardian,
+        research=research,
+        regimes=regimes,
     )
     runner.install_signal_handlers()
     print(
@@ -614,6 +634,8 @@ def build_parser() -> argparse.ArgumentParser:
     rs2.add_argument("--digest", action="store_true", help="build today's digest now")
     rs2.add_argument("--force", action="store_true", help="rebuild the digest if it exists")
     rs2.add_argument("--no-ai", action="store_true", help="digest from the numbers only")
+    rg = sub.add_parser("regimes", help="today's regime per market and results per regime")
+    add_data(rg)
     ex = sub.add_parser("export", help="write the journal's decisions and trades to Parquet")
     ex.add_argument("--out", default="store", help="output folder (default: store)")
     ex.add_argument("--mode", choices=["paper", "live", "backtest"], default=None)
@@ -658,6 +680,32 @@ def cmd_research(cfg: Config, args: argparse.Namespace) -> int:
     print(f"macro calendar: {len(feed.calendar.events)} events, {cover:.0f} days of cover")
     if cover < cfg.research.calendar_warn_days:
         print(f"  WARNING: add upcoming events to {cfg.research.calendar_file}")
+    return 0
+
+
+def cmd_regimes(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.regime import RegimeDetector, regime_performance
+
+    bars = load_bars(cfg, args.data, args.days or 60)
+    det = RegimeDetector.from_bars(cfg.regime, bars)
+    today = datetime.now(UTC).date()
+    print(f"Regimes for {today} (UTC), from completed days only:")
+    for symbol in cfg.symbols:
+        info = det.classify(symbol, today)
+        detail = ", ".join(
+            f"{k.removeprefix('regime_')} {v:.2f}"
+            for k, v in info.items()
+            if k != "regime" and isinstance(v, float)
+        )
+        print(f"  {symbol:<9} {info['regime']:<9} {detail}")
+    journal = Journal(cfg.journal_path, mode=cfg.mode)
+    perf = regime_performance(journal.trades(mode=cfg.mode), by=["strategy"])
+    print(f"\n{cfg.mode} results by strategy and regime:")
+    print("  (no trades yet)" if perf.empty else perf.to_string(index=False))
+    result = latest_result(cfg)
+    if result is not None and result.regime_table:
+        print(f"\nlatest {result.strategy} backtest, out of sample, by regime:")
+        print(pd.DataFrame(result.regime_table).to_string(index=False))
     return 0
 
 
@@ -707,6 +755,7 @@ COMMANDS = {
     "account": cmd_account,
     "export": cmd_export,
     "research": cmd_research,
+    "regimes": cmd_regimes,
     "replay": cmd_replay,
 }
 

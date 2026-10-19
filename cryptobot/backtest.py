@@ -63,6 +63,7 @@ class BacktestResult:
     params_history: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     decider: str = "none"
+    regime_table: list[dict[str, Any]] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
     @property
@@ -372,6 +373,7 @@ def run_backtest(
     journal: Journal | None = None,
     notes: list[str] | None = None,
     decider=None,
+    context_providers: list | None = None,
 ) -> BacktestResult:
     module = (
         strategy if isinstance(strategy, ModuleType) else load_strategy(strategy or cfg.strategy)
@@ -381,10 +383,23 @@ def run_backtest(
     if not days:
         raise ValueError("no bars to backtest")
     train_days, test_days = split_days(days, cfg.learning.train_fraction)
+    from cryptobot.regime import RegimeDetector, regime_performance
 
-    _, is_trades, is_equity = run_period(cfg, module, base, bars_by_symbol, train_days)
+    regimes = RegimeDetector.from_bars(cfg.regime, bars_by_symbol)
+    providers = [regimes.context, *(context_providers or [])]
+
+    _, is_trades, is_equity = run_period(
+        cfg, module, base, bars_by_symbol, train_days, context_providers=providers
+    )
     oos_engine, oos_trades, oos_equity = run_period(
-        cfg, module, base, bars_by_symbol, test_days, journal, decider=decider
+        cfg,
+        module,
+        base,
+        bars_by_symbol,
+        test_days,
+        journal,
+        decider=decider,
+        context_providers=providers,
     )
     metrics = compute_metrics(oos_trades, oos_equity, cfg.starting_cash)
     metrics["cash_capped_entries"] = oos_engine.capped_entries
@@ -426,4 +441,5 @@ def run_backtest(
         bench_equity={"buy_and_hold": bh_equity, "random_entry": rnd_equity},
         notes=notes,
         decider=decider.describe() if decider is not None else "none",
+        regime_table=regime_performance(oos_trades).to_dict("records"),
     )

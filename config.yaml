@@ -118,6 +118,15 @@ research:
   digest_model: claude-haiku-5-5
   max_daily_cost_usd: 0.05
 
+# Market regimes, one label per market per UTC day from completed days only. Results are
+# tracked per regime; the learning loop needs a challenger to be profitable in at least two.
+regime:
+  high_vol_ratio: 1.6              # 5-day volatility this many times the 20-day = high_vol
+  trending_efficiency: 0.35        # 14-day efficiency ratio at or above this = trending (else ranging)
+  risk_off_breadth: 0.34           # risk_off: at most a third of markets above their 20-day average
+  risk_off_market_ret_pct: -10     #   and the average 20-day return at or below -10%
+  risk_off_fear_greed: 20          #   or Fear & Greed at or below 20 with half the markets below average
+
 poll_seconds: 30                   # how often the 24/7 loop checks prices for software stops
 journal_path: cryptobot.sqlite
 reports_dir: reports

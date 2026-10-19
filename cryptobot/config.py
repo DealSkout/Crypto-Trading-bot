@@ -179,6 +179,21 @@ class ResearchConfig:
     max_daily_cost_usd: float = 0.05
 
 
+@dataclass
+class RegimeConfig:
+    """Rule thresholds for cryptobot/regime.py (one label per market per UTC day)."""
+
+    vol_short_days: int = 5
+    vol_long_days: int = 20
+    high_vol_ratio: float = 1.6  # 5-day vol this many times the 20-day vol = high_vol
+    er_days: int = 14
+    trending_efficiency: float = 0.35  # efficiency ratio at or above this = trending
+    ma_days: int = 20
+    risk_off_breadth: float = 0.34  # at most this share of markets above their 20-day average
+    risk_off_market_ret_pct: float = -10.0  # ...and the average 20-day return at or below this
+    risk_off_fear_greed: float = 20.0  # or extreme fear with half the markets below average
+
+
 VALID_EXCHANGES = ("okx", "bybit", "binance")
 RESEARCH_SOURCES = ("fear_greed", "funding", "open_interest", "news")
 
@@ -203,6 +218,7 @@ class Config:
     decider: DeciderConfig = field(default_factory=DeciderConfig)
     guardian: GuardianConfig = field(default_factory=GuardianConfig)
     research: ResearchConfig = field(default_factory=ResearchConfig)
+    regime: RegimeConfig = field(default_factory=RegimeConfig)
     poll_seconds: int = 30
     journal_path: str = "cryptobot.sqlite"
     reports_dir: str = "reports"
@@ -260,6 +276,7 @@ def from_dict(raw: dict[str, Any], path: str = "config.yaml") -> Config:
         decider=_build(DeciderConfig, raw.get("decider"), "decider"),
         guardian=_build(GuardianConfig, raw.get("guardian"), "guardian"),
         research=_build(ResearchConfig, raw.get("research"), "research"),
+        regime=_build(RegimeConfig, raw.get("regime"), "regime"),
         poll_seconds=int(raw.get("poll_seconds", 30)),
         journal_path=str(raw.get("journal_path", "cryptobot.sqlite")),
         reports_dir=str(raw.get("reports_dir", "reports")),
@@ -334,6 +351,9 @@ def validate(cfg: Config) -> None:
         raise ConfigError("guardian day/halt/error limits must be >= 1")
     if not (0 <= g.min_confidence <= 1):
         raise ConfigError("guardian.min_confidence must be between 0 and 1")
+    rg = cfg.regime
+    if min(rg.vol_short_days, rg.er_days, rg.ma_days) < 2 or rg.vol_long_days <= rg.vol_short_days:
+        raise ConfigError("regime: windows must be >= 2 days and vol_long_days > vol_short_days")
     rs = cfg.research
     bad = [x for x in rs.exchanges if x not in VALID_EXCHANGES]
     if bad:

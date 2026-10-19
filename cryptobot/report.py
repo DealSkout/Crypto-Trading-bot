@@ -15,7 +15,8 @@ from cryptobot.backtest import BacktestResult
 ROWS = [
     ("Net return", "net_return_pct", "{:+.2f}%"),
     ("Max drawdown", "max_drawdown_pct", "{:.2f}%"),
-    ("Sharpe (annualised, daily)", "sharpe", "{:.2f}"),
+    ("Sharpe (annualised over 365 days)", "sharpe", "{:.2f}"),
+    ("Sortino (annualised over 365 days)", "sortino", "{:.2f}"),
     ("Trades", "n_trades", "{:d}"),
     ("Win rate", "win_rate_pct", "{:.1f}%"),
     ("Average R", "avg_r", "{:+.2f}"),
@@ -102,6 +103,20 @@ def render_markdown(r: BacktestResult) -> str:
         out.append(f"| {label} | " + " | ".join(_fmt(fmt, m.get(key)) for _, m in cols) + " |")
     out += ["", "## Verdict", ""]
     out += [f"- {line}" for line in verdict_lines(r)]
+    if r.regime_table:
+        out += [
+            "",
+            "## Out of sample by regime",
+            "",
+            "| Regime | Trades | Win rate | Avg R | Net P&L | Profit factor |",
+            "|---|---|---|---|---|---|",
+        ]
+        for row in r.regime_table:
+            pf = _fmt("{:.2f}", row["profit_factor"])
+            out.append(
+                f"| {row['regime']} | {row['trades']} | {row['win_rate_pct']:.1f}% |"
+                f" {row['avg_r']:+.2f} | {row['net_pnl']:+.2f} | {pf} |"
+            )
     if r.notes:
         out += ["", "## Notes", ""] + [f"- {n}" for n in r.notes]
     if r.params_history:

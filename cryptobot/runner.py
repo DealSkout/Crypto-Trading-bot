@@ -39,10 +39,12 @@ class Runner:
         flatten_on_exit: bool = True,
         guardian=None,
         research=None,
+        regimes=None,
     ) -> None:
         self.cfg = cfg
         self.guardian = guardian
         self.research = research
+        self.regimes = regimes
         self.mode = mode
         self.engine = engine
         self.fetch_bars = fetch_bars
@@ -199,6 +201,8 @@ class Runner:
                 n = HISTORY_SESSIONS * (market.session_minutes // self.cfg.timeframe_minutes)
                 window = completed.tail(n)
                 window.attrs = dict(bars.attrs)
+                if self.regimes is not None:  # breadth needs every market's completed days
+                    self.regimes.update_from_bars(symbol, window)
                 self.engine.on_bar(symbol, window)
             else:
                 self.engine.on_tick(symbol, float(bars["close"].iloc[-1]), now)
@@ -247,8 +251,15 @@ class Runner:
             from cryptobot.research.digest import make_digest_llm, run_daily_digest
 
             llm = make_digest_llm(self.cfg) if self.cfg.research.digest else None
+            regimes = self.regimes.current(now.date()) if self.regimes is not None else None
             return run_daily_digest(
-                self.cfg, self.engine.journal, self.research, day, llm=llm, now=now
+                self.cfg,
+                self.engine.journal,
+                self.research,
+                day,
+                llm=llm,
+                now=now,
+                regimes=regimes,
             )
         except Exception as e:  # pragma: no cover - research must never stop trading
             log.warning("research digest failed: %s", e)
