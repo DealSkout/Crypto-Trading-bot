@@ -169,7 +169,7 @@ def test_engine_caps_the_stop_distance(cfg):
         w = df.iloc[:i]
         w.attrs = dict(df.attrs)
         engine.on_bar("BTC/USD", w)
-    t = engine.open["BTC/USD"]
+    t = engine.open["BTC/USD"][0]
     assert abs(t.stop - 99.0) < 1e-9 and t.reason.endswith("(stop capped)")
     assert "stop_capped" in set(journal.events()["kind"])
 

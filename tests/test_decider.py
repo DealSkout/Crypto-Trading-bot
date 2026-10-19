@@ -163,7 +163,7 @@ def test_last_resort_uses_rules_when_they_fire(cfg):
     d = Decider(dcfg(role="last_resort"), llm, Journal(":memory:"))
     engine = make_engine(cfg, StubStrategy(fire_at=1, stop_pct=1.0), d)
     feed(engine, bars_from_closes([100.0] * 4))
-    assert "BTC/USD" in engine.open and llm.calls == [] and engine.open["BTC/USD"].reason == "stub"
+    assert "BTC/USD" in engine.open and llm.calls == [] and engine.open["BTC/USD"][0].reason == "stub"
 
 
 def test_last_resort_asks_model_when_rules_are_silent(cfg):
@@ -172,7 +172,7 @@ def test_last_resort_asks_model_when_rules_are_silent(cfg):
     engine = make_engine(cfg, StubStrategy(fire_at=999), d)
     feed(engine, bars_from_closes([100.0] * 8))
     assert len(llm.calls) == 1
-    t = engine.open["BTC/USD"]
+    t = engine.open["BTC/USD"][0]
     assert t.stop == 99.0 and t.reason.startswith("claude:")
     ev = d.journal.events(kinds=["decider"])
     assert len(ev) == 1 and ev["message"].iloc[0].startswith("buy")
@@ -188,7 +188,7 @@ def test_final_say_rejects_then_approves(cfg):
     d2 = Decider(dcfg(role="final_say"), FakeLLM([buy(stop=99.2)]), Journal(":memory:"))
     engine2 = make_engine(cfg, StubStrategy(fire_at=2, stop_pct=1.0), d2)
     feed(engine2, bars_from_closes([100.0] * 3))
-    assert engine2.open["BTC/USD"].stop == pytest.approx(99.2)  # Claude's tighter stop was used
+    assert engine2.open["BTC/USD"][0].stop == pytest.approx(99.2)  # Claude's tighter stop was used
 
     wrong = {
         "action": "sell",

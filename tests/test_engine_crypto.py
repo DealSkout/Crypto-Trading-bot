@@ -113,7 +113,7 @@ def test_exposure_cap_limits_the_second_position(cfg):
     b = FakeAlpaca()
     engine, journal = engine_with(cfg, b, StubStrategy(fire_at=2, stop_pct=1.0))
     feed(engine, df)
-    pos_value = engine.open["BTC/USD"].qty * 100
+    pos_value = engine.open["BTC/USD"][0].qty * 100
     assert pos_value <= 0.30 * 10_000 + 1e-6
     reasons = journal.events(kinds=["skip"])["message"].tolist()
     assert not reasons  # first entry fits; it is just sized down

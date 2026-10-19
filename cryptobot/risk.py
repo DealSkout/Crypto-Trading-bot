@@ -107,7 +107,10 @@ class RiskManager:
             return False, f"halted: {s.halt_reason}"
         if symbol in s.blocked_symbols:
             return False, "entries closed for the day after the end-of-day flatten"
-        if minutes_to_close <= self.cfg.flatten_minutes_before_close:
+        if (
+            self.cfg.session_policy != "swing"
+            and minutes_to_close <= self.cfg.flatten_minutes_before_close
+        ):
             return False, "too close to the close"
         if side == "short" and not self.allow_short:
             return False, "long-only: crypto cannot be shorted (no margin)"
@@ -132,6 +135,8 @@ class RiskManager:
         return False
 
     def should_flatten(self, minutes_to_close: float) -> bool:
+        if self.cfg.session_policy == "swing":
+            return False  # swing bots hold across the UTC day roll
         return minutes_to_close <= self.cfg.flatten_minutes_before_close
 
     @staticmethod

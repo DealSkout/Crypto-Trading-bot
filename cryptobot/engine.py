@@ -94,7 +94,7 @@ class Engine:
         self.journal = journal
         self.mode = mode
         self.notifier = notifier
-        self.open: dict[str, OpenTrade] = {}
+        self.open: dict[str, list[OpenTrade]] = {}  # symbol -> open lots, oldest first
         self.trades: list[TradeRecord] = []
         self.equity_curve: list[tuple[datetime, float]] = []
         self.last_prices: dict[str, float] = {}
@@ -121,10 +121,20 @@ class Engine:
     def equity(self) -> float:
         return float(self.broker.get_equity())
 
+    def lots(self, symbol: str) -> list[OpenTrade]:
+        return self.open.get(symbol, [])
+
+    def total_lots(self) -> int:
+        return sum(len(lots) for lots in self.open.values())
+
+    def _all_lots(self):
+        for lots in self.open.values():
+            yield from lots
+
     def open_exposure(self) -> float:
         """Market value of every open position (the account-wide exposure cap uses this)."""
         return sum(
-            t.qty * self.last_prices.get(t.symbol, t.entry_price) for t in self.open.values()
+            t.qty * self.last_prices.get(t.symbol, t.entry_price) for t in self._all_lots()
         )
 
     def _start_day(self, day, ts: datetime) -> None:
@@ -164,8 +174,7 @@ class Engine:
         mtc = sessions.minutes_to_close(market, bar_end)
         self._fill_pending(symbol, bar, ts, mtc)
 
-        trade = self.open.get(symbol)
-        if trade is not None:
+        for trade in list(self.lots(symbol)):
             decision = RiskManager.check_exit(
                 trade.side,
                 trade.stop,
@@ -175,7 +184,7 @@ class Engine:
                 float(bar["low"]),
             )
             if decision is not None:
-                self._exit(symbol, decision.reason, decision.price, ts)
+                self._exit(symbol, decision.reason, decision.price, ts, trade=trade)
             elif (
                 self.decider is not None
                 and self.decider.role == "primary"
@@ -197,7 +206,7 @@ class Engine:
                 self._flatten("eod", ts, symbols=same_market)
             self.risk.block_entries(symbol)
 
-        if symbol not in self.open and not self.risk.state.halted:
+        if len(self.lots(symbol)) < self.cfg.max_lots_per_symbol and not self.risk.state.halted:
             self._maybe_enter(symbol, bars, ts, mtc)
 
         self.equity_curve.append((ts, self.equity()))
@@ -208,7 +217,7 @@ class Engine:
         """Write the engine's current state to the journal (the dashboard reads it)."""
         s = self.risk.state
         open_trades = []
-        for t in self.open.values():
+        for t in self._all_lots():
             last = self.last_prices.get(t.symbol, t.entry_price)
             direction = 1.0 if t.side == "long" else -1.0
             open_trades.append(
@@ -262,16 +271,16 @@ class Engine:
         """Between bars (live/paper): check software stops against the latest price."""
         self.broker.mark(symbol, price, ts)
         self.last_prices[symbol] = price
-        trade = self.open.get(symbol)
-        if trade is None:
-            return
-        decision = RiskManager.check_exit(trade.side, trade.stop, trade.target, price, price, price)
-        if decision is not None:
-            self._exit(symbol, decision.reason, decision.price, ts)
+        for trade in list(self.lots(symbol)):
+            decision = RiskManager.check_exit(
+                trade.side, trade.stop, trade.target, price, price, price
+            )
+            if decision is not None:
+                self._exit(symbol, decision.reason, decision.price, ts, trade=trade)
 
     def end_of_data(self, ts: datetime | None = None) -> None:
         if self.open:
-            last = ts or max(t.entry_ts for t in self.open.values())
+            last = ts or max(t.entry_ts for t in self._all_lots())
             self._flatten("end_of_data", last)
         if self.risk.state.day is not None:
             self.journal.record_daily(
@@ -313,7 +322,7 @@ class Engine:
 
     def _try_enter(self, symbol: str, sig: Signal, ts: datetime, mtc: float) -> bool:
         sig = self._cap_stop(symbol, sig, ts)
-        ok, why = self.risk.can_enter(symbol, sig.side, len(self.open), mtc)
+        ok, why = self.risk.can_enter(symbol, sig.side, self.total_lots(), mtc)
         if not ok:
             self._log_skip(symbol, why, sig, ts)
             return False
@@ -358,7 +367,7 @@ class Engine:
                 # Simulated fills happen at the NEXT bar's open. Pre-check entry rules now so
                 # an impossible signal (near the close, halted, position open) is reported at
                 # signal time instead of silently queueing.
-                ok, why = self.risk.can_enter(symbol, sig.side, len(self.open), mtc)
+                ok, why = self.risk.can_enter(symbol, sig.side, self.total_lots(), mtc)
                 if not ok:
                     self._log_skip(symbol, why, sig, ts)
                     return
@@ -404,12 +413,13 @@ class Engine:
     def _decision_context(self, symbol: str, bars: pd.DataFrame, sig: Signal | None, mtc: float):
         cm = getattr(self.risk, "cost_model", None)
         rt = cm.round_trip_cost_pct(fx=self.risk._fx_for(symbol)) if cm is not None else 0.0
+        lots = self.lots(symbol)
         return build_context(
             symbol,
             bars,
             self.equity(),
             self.broker.get_cash(),
-            self.open.get(symbol),
+            lots[0] if lots else None,
             sig,
             self.cfg.risk,
             self.cfg.allow_short,
@@ -432,7 +442,7 @@ class Engine:
             return
         if role != "final_say" and not self.decider.due(symbol, ts):
             return
-        ok, _why = self.risk.can_enter(symbol, "long", len(self.open), mtc)
+        ok, _why = self.risk.can_enter(symbol, "long", self.total_lots(), mtc)
         if not ok:
             return  # do not pay for a decision we could not act on
         decision = self.decider.decide(self._decision_context(symbol, bars, sig, mtc), ts)
@@ -472,9 +482,10 @@ class Engine:
         self._try_enter(symbol, llm_sig, ts, mtc)
 
     def _llm_manage_open(self, symbol: str, bars: pd.DataFrame, ts: datetime, mtc) -> None:
-        trade = self.open.get(symbol)
-        if trade is None:
+        lots = self.lots(symbol)
+        if not lots:
             return
+        trade = lots[0]
         market = sessions.market_for(symbol)
         tf = int(bars.attrs.get("timeframe") or self.cfg.timeframe_minutes)
         mtc = sessions.minutes_to_close(market, ts + timedelta(minutes=tf)) if mtc is None else mtc
@@ -487,7 +498,9 @@ class Engine:
             or (decision.action == "buy" and trade.side == "short")
         )
         if closing:
-            self._exit(symbol, "llm_close", self.last_prices.get(symbol, trade.entry_price), ts)
+            self._exit(
+                symbol, "llm_close", self.last_prices.get(symbol, trade.entry_price), ts, trade=trade
+            )
 
     def _enter(self, symbol: str, sig: Signal, qty: float, ts: datetime) -> None:
         side = "buy" if sig.side == "long" else "sell"
@@ -543,7 +556,7 @@ class Engine:
                         qty = have
                 except BrokerError:
                     pass
-        self.open[symbol] = OpenTrade(
+        self.open.setdefault(symbol, []).append(OpenTrade(
             symbol=symbol,
             side=sig.side,
             qty=qty,
@@ -555,9 +568,9 @@ class Engine:
             implicit_cost=order.implicit_cost,
             risk_per_unit=sig.risk_per_unit,
             reason=sig.reason,
-        )
+        ))
         self.risk.record_entry(symbol)
-        if getattr(self.broker, "supports_protective_stop", False):
+        if getattr(self.broker, "supports_protective_stop", False) and len(self.open[symbol]) == 1:
             try:
                 # resting stop-limit at the exchange: survives a crashed process
                 self.broker.place_protective_stop(
@@ -579,10 +592,20 @@ class Engine:
             self._say(f"ENTRY {sig.side} {qty} {symbol} @ {price:.2f} (stop {sig.stop:.2f})")
 
     # ----------------------------------------------------------------------- exits
-    def _exit(self, symbol: str, reason: str, ref_price: float, ts: datetime) -> None:
-        trade = self.open.get(symbol)
-        if trade is None:
+    def _exit(
+        self,
+        symbol: str,
+        reason: str,
+        ref_price: float,
+        ts: datetime,
+        trade: OpenTrade | None = None,
+    ) -> None:
+        lots = self.lots(symbol)
+        if not lots:
             return
+        trade = lots[0] if trade is None else trade
+        if trade not in lots:
+            return  # already closed (e.g. flattened earlier in the same pass)
         side = "sell" if trade.side == "long" else "buy"
         if reason == "stop" and getattr(self.broker, "delayed_entry", False):
             # software stops fill late in fast moves; push the simulated fill through the stop
@@ -658,15 +681,21 @@ class Engine:
         self.day_pnl += pnl
         self.day_costs += rec.costs
         self.day_trades += 1
-        del self.open[symbol]
+        lots.remove(trade)
+        if not lots:
+            del self.open[symbol]
         if self.mode != "backtest":
             self._say(f"EXIT ({reason}) {symbol} @ {exit_price:.2f} pnl {pnl:+.2f}")
 
     def _flatten(self, reason: str, ts: datetime, symbols: list[str] | None = None) -> None:
         for symbol in list(symbols or self.open):
-            if symbol in self.open:
+            for trade in list(self.lots(symbol)):
                 self._exit(
-                    symbol, reason, self.last_prices.get(symbol, self.open[symbol].entry_price), ts
+                    symbol,
+                    reason,
+                    self.last_prices.get(symbol, trade.entry_price),
+                    ts,
+                    trade=trade,
                 )
         if symbols is None and self.mode != "backtest":
             try:

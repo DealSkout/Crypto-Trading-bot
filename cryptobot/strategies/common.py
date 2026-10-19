@@ -93,3 +93,42 @@ def minutes_to_close(bars: pd.DataFrame) -> float:
 
 def minutes_since_open(bars: pd.DataFrame) -> float:
     return sessions.minutes_since_open(market_of(bars), now_of(bars))
+
+
+def rsi(close: pd.Series, period: int = 14) -> float | None:
+    """Wilder's RSI of the last bar; None until enough history exists."""
+    if len(close) < period * 3:
+        return None
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
+    last_loss = float(loss.iloc[-1])
+    if last_loss == 0:
+        return 100.0
+    rs = float(gain.iloc[-1]) / last_loss
+    return 100.0 - 100.0 / (1.0 + rs)
+
+
+def adx(bars: pd.DataFrame, period: int = 14) -> float | None:
+    """Wilder's ADX (trend strength, 0-100) of the last bar; None until enough history.
+    Shared by the trend and mean-reversion bots and by the regime detector, so every
+    consumer agrees on what 'trending' means."""
+    if len(bars) < period * 3:
+        return None
+    high, low, close = bars["high"], bars["low"], bars["close"]
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    alpha = 1.0 / period
+    atr_series = tr.ewm(alpha=alpha, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_series
+    minus_di = 100 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_series
+    denom = (plus_di + minus_di).replace(0, pd.NA)
+    dx = ((plus_di - minus_di).abs() / denom * 100).fillna(0.0)
+    value = float(dx.ewm(alpha=alpha, adjust=False).mean().iloc[-1])
+    return value if pd.notna(value) else None

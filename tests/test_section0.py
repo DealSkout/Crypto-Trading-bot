@@ -44,7 +44,7 @@ def test_entry_fills_at_next_bar_open(cfg):
     feed_window.attrs = dict(df.attrs)
     engine.on_bar("BTC/USD", feed_window)
     assert "BTC/USD" in engine.open
-    trade = engine.open["BTC/USD"]
+    trade = engine.open["BTC/USD"][0]
     expected = broker.cost_model.fill_price(float(df["open"].iloc[2]), is_buy=True)
     assert trade.entry_price == pytest.approx(expected)
 

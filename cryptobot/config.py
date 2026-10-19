@@ -47,6 +47,7 @@ class RiskConfig:
     flatten_minutes_before_close: int = 10
     max_stop_pct: float = 3.0  # no stop may sit further than this from the entry
     max_total_exposure_pct: float = 100.0  # all open positions together, % of equity
+    session_policy: str = "day"  # day (flatten before 00:00 UTC) | swing (hold across days)
 
 
 @dataclass
@@ -147,6 +148,7 @@ class Config:
     starting_cash: float = 1000.0
     allow_short: bool = False  # always false: crypto is long-only, no margin
     max_entries_per_day: int = 1
+    max_lots_per_symbol: int = 1  # >1 lets a strategy ladder several concurrent lots (grid)
     risk: RiskConfig = field(default_factory=RiskConfig)
     costs: CostConfig = field(default_factory=CostConfig)
     orders: OrderConfig = field(default_factory=OrderConfig)
@@ -202,6 +204,7 @@ def from_dict(raw: dict[str, Any], path: str = "config.yaml") -> Config:
         starting_cash=float(raw.get("starting_cash", 1000.0)),
         allow_short=bool(raw.get("allow_short", False)),
         max_entries_per_day=int(raw.get("max_entries_per_day", 1)),
+        max_lots_per_symbol=int(raw.get("max_lots_per_symbol", 1)),
         risk=_build(RiskConfig, raw.get("risk"), "risk"),
         costs=_build(CostConfig, raw.get("costs"), "costs"),
         orders=_build(OrderConfig, raw.get("orders"), "orders"),
@@ -232,6 +235,10 @@ def validate(cfg: Config) -> None:
             raise ConfigError(f"{s!r} is not a USD crypto pair like BTC/USD or ETH/USD")
     if cfg.allow_short:
         raise ConfigError("allow_short must be false: crypto is long-only (no shorting, no margin)")
+    if cfg.risk.session_policy not in ("day", "swing"):
+        raise ConfigError("risk.session_policy must be 'day' or 'swing'")
+    if cfg.max_lots_per_symbol < 1:
+        raise ConfigError("max_lots_per_symbol must be at least 1")
     o = cfg.orders
     if o.time_in_force not in VALID_TIME_IN_FORCE:
         raise ConfigError(f"orders.time_in_force must be one of {VALID_TIME_IN_FORCE}")
