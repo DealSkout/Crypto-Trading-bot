@@ -18,6 +18,17 @@ risk:
   flatten_minutes_before_close: 10 # flatten everything this long before 00:00 UTC (day trading)
   max_stop_pct: 3.0                # no stop may sit further than this from the entry, whoever set it
   max_total_exposure_pct: 100      # all open positions together, as % of equity (100 = no leverage)
+  # Position sizing. Whatever the method, a trade never risks more than risk_per_trade_pct.
+  sizing: min                      # risk | vol_target | kelly | min (the smallest of all three)
+  target_daily_vol_pct: 1.0        # vol_target: a position's typical daily move <= 1% of equity
+  kelly_fraction: 0.25             # kelly: a quarter of the Kelly fraction (never more than 0.25)
+  kelly_min_trades: 30             # ...measured on the last closed trades, once there are 30
+  kelly_lookback_trades: 100
+  kelly_floor_pct: 0.1             # with no measured edge, keep trading at 0.1% risk to learn
+  # Automatic pauses of NEW entries (open trades keep their stops and exits):
+  pause_on_macro: true             # inside a macro_calendar.yaml high-risk window (FOMC, CPI...)
+  pause_on_stale_data: true        # no new bar for stale_bars bar lengths, or a required research
+  stale_bars: 3                    #   source (research.required_sources) gone stale
 
 costs:
   commission: 0                    # flat per order, USD (Alpaca crypto: 0)

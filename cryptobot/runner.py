@@ -49,6 +49,18 @@ class Runner:
         self.regimes = regimes
         self.registry = registry
         self.shadows = shadows
+        # automatic pauses of new entries (risk.pause_on_macro / pause_on_stale_data)
+        self.stale_prices: dict[str, str] = {}
+        self.active_pauses: dict[str, str] = {}
+        self.calendar = None
+        if cfg.risk.pause_on_macro:
+            if research is not None:
+                self.calendar = research.calendar
+            else:
+                from cryptobot.research.calendar import MacroCalendar
+
+                self.calendar = MacroCalendar.load(cfg.research.calendar_file)
+        engine.pauses.append(self.pause_reason)
         self.mode = mode
         self.engine = engine
         self.fetch_bars = fetch_bars
@@ -138,6 +150,50 @@ class Runner:
         finally:
             self.shutdown()
 
+    # ------------------------------------------------------------------ pauses
+    def pause_reason(self, symbol: str, ts: datetime) -> str | None:
+        """Why new entries are paused for `symbol` right now, or None."""
+        when = self.clock()
+        if self.calendar is not None:
+            ev = self.calendar.active(when, symbol)
+            if ev is not None:
+                start, end = ev.window
+                return f"macro window {ev.name} ({start:%H:%M}-{end:%H:%M} UTC)"
+        if self.cfg.risk.pause_on_stale_data:
+            if symbol in self.stale_prices:
+                return self.stale_prices[symbol]
+            if self.research is not None and self.cfg.research.required_sources:
+                stale = self.research.stale_sources(when)
+                if stale:
+                    return f"research feed stale: {', '.join(stale)}"
+        return None
+
+    def track_pauses(self, now: datetime) -> None:
+        """Journal and announce each pause when it starts and ends (risk events)."""
+        for symbol in self.cfg.symbols:
+            reason = self.pause_reason(symbol, now)
+            before = self.active_pauses.get(symbol)
+            if reason and not before:
+                self.active_pauses[symbol] = reason
+                self.journal.log("pause_start", reason, symbol=symbol, ts=now)
+                self.say(f"PAUSE {symbol}: no new entries ({reason})")
+            elif before and not reason:
+                del self.active_pauses[symbol]
+                self.journal.log("pause_end", before, symbol=symbol, ts=now)
+                self.say(f"RESUMED {symbol}: entries allowed again (was: {before})")
+            elif reason and before != reason:
+                self.active_pauses[symbol] = reason
+
+    def check_stale(self, symbol: str, completed: pd.DataFrame, now: datetime) -> None:
+        tf = timedelta(minutes=self.cfg.timeframe_minutes)
+        limit = tf * self.cfg.risk.stale_bars
+        last_end = completed.index[-1].to_pydatetime() + tf if len(completed) else None
+        if last_end is None or now - last_end > limit:
+            age = "no bars" if last_end is None else f"last bar ended {last_end:%H:%M} UTC"
+            self.stale_prices[symbol] = f"price data stale ({age})"
+        else:
+            self.stale_prices.pop(symbol, None)
+
     def reconcile_on_start(self) -> None:
         """The bot day-trades and always starts flat. A position or order already at the
         broker means the last run died without flattening (a backup stop may still be resting
@@ -194,9 +250,8 @@ class Runner:
                 continue
             active = True
             bars = self.fetch_bars(symbol)
-            if bars.empty:
-                continue
-            completed = bars[(bars.index + tf) <= now]
+            completed = bars[(bars.index + tf) <= now] if not bars.empty else bars
+            self.check_stale(symbol, completed, now)
             if completed.empty:
                 continue
             last = completed.index[-1]
@@ -216,6 +271,7 @@ class Runner:
                 if self.shadows is not None:
                     self.shadows.on_tick(symbol, price, now)
         self.check_day_rollover(now)
+        self.track_pauses(now)
         try:
             self.journal.set_state(
                 "heartbeat",

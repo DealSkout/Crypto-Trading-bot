@@ -31,8 +31,18 @@ RISK_KEYS = frozenset(
         "flatten_minutes_before_close",
         "max_stop_pct",
         "max_total_exposure_pct",
+        "sizing",
+        "target_daily_vol_pct",
+        "kelly_fraction",
+        "kelly_min_trades",
+        "kelly_lookback_trades",
+        "kelly_floor_pct",
+        "pause_on_macro",
+        "pause_on_stale_data",
+        "stale_bars",
     }
 )
+VALID_SIZING = ("risk", "vol_target", "kelly", "min")
 
 
 class ConfigError(ValueError):
@@ -47,6 +57,22 @@ class RiskConfig:
     flatten_minutes_before_close: int = 10
     max_stop_pct: float = 3.0  # no stop may sit further than this from the entry
     max_total_exposure_pct: float = 100.0  # all open positions together, % of equity
+    # position sizing, always capped by risk_per_trade_pct:
+    #   risk        risk_per_trade_pct of equity between entry and stop
+    #   vol_target  also no bigger than a position whose typical daily move is
+    #               target_daily_vol_pct of equity
+    #   kelly       risk kelly_fraction x the Kelly fraction of recent trades (<= the cap)
+    #   min         the smallest of all three
+    sizing: str = "min"
+    target_daily_vol_pct: float = 1.0
+    kelly_fraction: float = 0.25  # never above 0.25
+    kelly_min_trades: int = 30  # below this many closed trades Kelly is not used
+    kelly_lookback_trades: int = 100
+    kelly_floor_pct: float = 0.1  # with no measured edge, keep trading this small (% risk)
+    # automatic pauses of NEW entries (open trades keep their stops)
+    pause_on_macro: bool = True  # inside a macro-calendar high-risk window
+    pause_on_stale_data: bool = True  # prices (or research.required_sources) gone stale
+    stale_bars: int = 3  # no new bar for this many bar lengths = stale
 
 
 @dataclass
@@ -359,6 +385,16 @@ def validate(cfg: Config) -> None:
         raise ConfigError("risk.max_stop_pct must be between 0 and 20 (percent)")
     if not (0 < r.max_total_exposure_pct <= 100):
         raise ConfigError("risk.max_total_exposure_pct must be between 0 and 100 (no leverage)")
+    if r.sizing not in VALID_SIZING:
+        raise ConfigError(f"risk.sizing must be one of {VALID_SIZING}")
+    if not (0 < r.kelly_fraction <= 0.25):
+        raise ConfigError("risk.kelly_fraction must be above 0 and at most 0.25")
+    if not (0 < r.target_daily_vol_pct <= 10) or not (0 <= r.kelly_floor_pct <= 1):
+        raise ConfigError("risk: 0 < target_daily_vol_pct <= 10 and 0 <= kelly_floor_pct <= 1")
+    if r.kelly_min_trades < 10 or r.kelly_lookback_trades < r.kelly_min_trades:
+        raise ConfigError("risk: kelly_min_trades >= 10 and kelly_lookback_trades >= it")
+    if r.stale_bars < 2:
+        raise ConfigError("risk.stale_bars must be at least 2")
     g = cfg.guardian
     if g.provider not in VALID_COACH_PROVIDERS:
         raise ConfigError(f"guardian.provider must be one of {VALID_COACH_PROVIDERS}")

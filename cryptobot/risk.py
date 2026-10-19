@@ -30,6 +30,26 @@ class ExitDecision:
     price: float  # reference price the exit order is sent against
 
 
+def kelly_risk_pct(r_multiples, fraction: float, floor_pct: float, min_trades: int) -> float | None:
+    """Fractional Kelly as a % of equity to risk per trade, from closed trades' R multiples.
+    f* = W - (1 - W) / B (W = win rate, B = average win / average loss, in R). None when there
+    are fewer than `min_trades` trades. With no measured edge it returns `floor_pct` so the bot
+    keeps trading small enough to learn. The caller caps it at risk_per_trade_pct."""
+    r = [float(x) for x in r_multiples if x == x]
+    if len(r) < min_trades:
+        return None
+    wins = [x for x in r if x > 0]
+    losses = [-x for x in r if x < 0]
+    if not wins:
+        return floor_pct
+    w = len(wins) / len(r)
+    if not losses:
+        return max(floor_pct, fraction * w * 100.0)
+    b = (sum(wins) / len(wins)) / (sum(losses) / len(losses))
+    f = w - (1.0 - w) / b
+    return max(floor_pct, fraction * f * 100.0)
+
+
 class RiskManager:
     def __init__(
         self,
@@ -67,16 +87,37 @@ class RiskManager:
         round_qty: Callable[[float], float],
         symbol: str = "",
         open_exposure: float = 0.0,
+        risk_pct: float | None = None,
+        daily_vol_pct: float | None = None,
     ) -> tuple[float, str]:
-        """Units such that (entry - stop) * units <= risk_per_trade_pct of equity, capped by
-        what cash can buy after spread, slippage and fees (no leverage) and by the account-wide
-        exposure cap (all open positions together <= max_total_exposure_pct of equity), rounded
-        down to what the broker can trade."""
+        """Units such that (entry - stop) * units <= the risk budget, capped by what cash can
+        buy after spread, slippage and fees (no leverage) and by the account-wide exposure cap
+        (all open positions together <= max_total_exposure_pct of equity), rounded down to what
+        the broker can trade.
+
+        The risk budget is risk_per_trade_pct of equity, or less: `risk_pct` (e.g. quarter
+        Kelly) can only lower it. With vol targeting (`daily_vol_pct`, the asset's typical daily
+        move in %), the position is also kept small enough that a typical day moves it by at
+        most target_daily_vol_pct of equity. Nothing here can make a position bigger."""
         per_unit = abs(entry - stop)
         if per_unit <= 0 or entry <= 0:
             return 0.0, "stop distance is zero"
-        risk_amount = equity * self.cfg.risk_per_trade_pct / 100.0
+        budget = self.cfg.risk_per_trade_pct
+        notes = []
+        if risk_pct is not None and risk_pct < budget:
+            budget = max(0.0, float(risk_pct))
+            notes.append(f"kelly {budget:.2f}%")
+        risk_amount = equity * budget / 100.0
         qty = risk_amount / per_unit
+        if daily_vol_pct is not None and daily_vol_pct > 0:
+            vol_qty = (
+                equity * self.cfg.target_daily_vol_pct / 100.0 / (entry * daily_vol_pct / 100.0)
+            )
+            if vol_qty < qty:
+                qty = vol_qty
+                notes.append(f"vol-target at {daily_vol_pct:.2f}% daily vol")
+        if qty <= 0:
+            return 0.0, "risk budget is zero"
         cm = self.cost_model
         fill = cm.fill_price(entry, True)
         fx = self._fx_for(symbol) if symbol else True
@@ -89,7 +130,7 @@ class RiskManager:
                 " already in open positions)"
             )
         exposure_limit = room / per_unit_cost
-        reason = "ok"
+        reason = f"ok ({', '.join(notes)})" if notes else "ok"
         if exposure_limit < min(qty, affordable):
             reason = "ok (capped by max_total_exposure_pct)"
         elif affordable < qty:

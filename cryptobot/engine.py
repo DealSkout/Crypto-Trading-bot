@@ -133,6 +133,8 @@ class Engine:
         # weights (capped at 1: a filter can only make a position smaller, never bigger)
         self.filters: dict[str, Any] = {}
         self._size_mult: dict[str, float] = {}
+        # pause checks: (symbol, ts) -> reason or None. Any reason blocks NEW entries.
+        self.pauses: list = []
         self._source: dict[str, pd.DataFrame] = {}  # the bar window behind the current signal
         self._info: dict[str, tuple[int, dict[str, Any]]] = {}
 
@@ -443,6 +445,14 @@ class Engine:
                 self._skip(symbol, why, sig, ts)
                 return False
             self._size_mult[symbol] = mult
+        for pause in self.pauses:  # macro windows, stale data: no NEW entries
+            try:
+                paused = pause(symbol, ts)
+            except Exception as e:  # pragma: no cover - a broken check pauses, never trades
+                paused = f"pause check failed: {e}"
+            if paused:
+                self._skip(symbol, f"paused: {paused}", sig, ts)
+                return False
         if defer and self.fill_next_open:
             self.pending[symbol] = (sig, ts)
             self.journal.log(
@@ -454,6 +464,7 @@ class Engine:
             )
             return True
         mult = min(1.0, max(0.0, self._size_mult.pop(symbol, 1.0)))
+        risk_pct, daily_vol = self._sizing_inputs(symbol)
         qty, why = self.risk.position_size(
             self.equity(),
             self.broker.get_cash(),
@@ -462,6 +473,8 @@ class Engine:
             lambda q: self.broker.round_qty_for(symbol, q * mult),
             symbol=symbol,
             open_exposure=self.open_exposure(),
+            risk_pct=risk_pct,
+            daily_vol_pct=daily_vol,
         )
         if qty <= 0:
             self._skip(symbol, why, sig, ts)
@@ -470,6 +483,33 @@ class Engine:
             self.capped_entries += 1
         self._enter(symbol, sig, qty, ts, signal_price=signal_price)
         return symbol in self.open
+
+    def _sizing_inputs(self, symbol: str) -> tuple[float | None, float | None]:
+        """(quarter-Kelly risk %, the asset's daily vol %) for the configured sizing method.
+        Either can only make a position smaller (risk.position_size caps everything)."""
+        method = self.cfg.risk.sizing
+        r = self.cfg.risk
+        risk_pct = daily_vol = None
+        if method in ("kelly", "min"):
+            from cryptobot.risk import kelly_risk_pct
+
+            try:
+                hist = self.journal.trades(mode=self.journal.mode)
+                if "version" in hist.columns and (hist["version"] == self.version).any():
+                    hist = hist[hist["version"] == self.version]  # this model's own record
+                recent = hist.tail(r.kelly_lookback_trades)
+                risk_pct = kelly_risk_pct(
+                    recent["r_multiple"].tolist(),
+                    r.kelly_fraction,
+                    r.kelly_floor_pct,
+                    r.kelly_min_trades,
+                )
+            except Exception as e:  # pragma: no cover - fall back to the plain risk cap
+                log.warning("kelly sizing unavailable: %s", e)
+        if method in ("vol_target", "min"):
+            feats = self._decision_info(symbol)["features"]
+            daily_vol = feats.get("vol_7d_pct") or feats.get("atr_14d_pct")
+        return risk_pct, daily_vol
 
     OPS = {
         "<": lambda a, b: a < b,
