@@ -135,6 +135,7 @@ def run_period(
     days: list[date],
     journal: Journal | None = None,
     decider=None,
+    context_providers: list | None = None,
 ) -> tuple[Engine, pd.DataFrame, pd.Series]:
     """Drive the engine over `days`, giving each strategy call up to HISTORY_SESSIONS of
     history before the first active day. Returns (engine, trades, equity curve in UTC)."""
@@ -150,6 +151,7 @@ def run_period(
     engine = Engine(
         cfg, strategy, params, broker, risk, journal or Journal(":memory:"), decider=decider
     )
+    engine.context_providers = list(context_providers or [])
     active = set(days)
     events: list[tuple[pd.Timestamp, str, int]] = []
     arrays: dict[str, tuple] = {}

@@ -102,6 +102,22 @@ guardian:
   max_daily_cost_usd: 0.50
   stop_file: cryptobot.STOPPED
 
+# Market research feed: free public data, cached, scheduled. It never trades: it adds features
+# to every decision, flags macro windows and writes one short digest a day.
+research:
+  enabled: true
+  exchanges: [okx, bybit, binance]  # funding rates and open interest: first that answers wins
+  rss_feeds:                         # headlines, scored locally with VADER (no LLM)
+    - https://www.coindesk.com/arc/outboundfeeds/rss/
+    - https://cointelegraph.com/rss
+    - https://www.theblock.co/rss.xml
+  cryptopanic: false                 # true + CRYPTOPANIC_TOKEN in .env adds CryptoPanic news
+  calendar_file: macro_calendar.yaml # FOMC, CPI, token unlocks: KEEP IT UP TO DATE
+  required_sources: []               # e.g. [funding]: new entries pause if these go stale
+  digest: true                       # at most ONE Claude call a day (Haiku); numbers only without a key
+  digest_model: claude-haiku-5-5
+  max_daily_cost_usd: 0.05
+
 poll_seconds: 30                   # how often the 24/7 loop checks prices for software stops
 journal_path: cryptobot.sqlite
 reports_dir: reports

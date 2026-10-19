@@ -1,5 +1,5 @@
 """Command line: backtest | paper | live | report | coach | refit | check | review | account |
-dashboard | guardian | resume | mcp | export | replay."""
+dashboard | guardian | resume | mcp | export | replay | research."""
 
 from __future__ import annotations
 
@@ -243,7 +243,17 @@ def run_loop(cfg: Config, mode: str, args: argparse.Namespace) -> int:
             "Review the dashboard and journal, then run `python -m cryptobot resume`."
         )
         return 4
-    runner = Runner(cfg, mode, engine, fetch, journal, notifier, guardian=guardian)
+    research = None
+    if cfg.research.enabled:
+        from cryptobot.research.feed import ResearchFeed
+        from cryptobot.research.store import ResearchStore
+
+        research = ResearchFeed(cfg, ResearchStore(cfg.journal_path))
+        research.start()  # background thread; never blocks or breaks the trading loop
+        engine.context_providers.append(research.context)
+    runner = Runner(
+        cfg, mode, engine, fetch, journal, notifier, guardian=guardian, research=research
+    )
     runner.install_signal_handlers()
     print(
         f"{mode} mode: broker={broker.name} strategy={cfg.strategy} params={params}"
@@ -597,6 +607,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mc.add_argument("--mode", choices=["paper", "live"], default=None, help="which journal")
     mc.add_argument("--read-only", action="store_true", help="leave out the stop_bot tool")
+    rs2 = sub.add_parser("research", help="the market research feed: status, refresh, digest")
+    rs2.add_argument("--refresh", action="store_true", help="refresh every source now")
+    rs2.add_argument("--backfill", action="store_true", help="pull history (for backtests)")
+    rs2.add_argument("--days", type=int, default=None, help="backfill depth in days")
+    rs2.add_argument("--digest", action="store_true", help="build today's digest now")
+    rs2.add_argument("--force", action="store_true", help="rebuild the digest if it exists")
+    rs2.add_argument("--no-ai", action="store_true", help="digest from the numbers only")
     ex = sub.add_parser("export", help="write the journal's decisions and trades to Parquet")
     ex.add_argument("--out", default="store", help="output folder (default: store)")
     ex.add_argument("--mode", choices=["paper", "live", "backtest"], default=None)
@@ -605,6 +622,43 @@ def build_parser() -> argparse.ArgumentParser:
     rr.add_argument("--mode", choices=["paper", "live"], default=None)
     add_data(rr)
     return p
+
+
+def cmd_research(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.research.digest import make_digest_llm, run_daily_digest
+    from cryptobot.research.feed import ResearchFeed
+    from cryptobot.research.store import ResearchStore
+
+    feed = ResearchFeed(cfg, ResearchStore(cfg.journal_path))
+    if args.backfill:
+        for source, result in feed.backfill(args.days).items():
+            print(f"backfill {source}: {result}")
+    elif args.refresh:
+        for source, result in feed.refresh(force=True).items():
+            print(f"refresh {source}: {result}")
+    if args.digest:
+        now = datetime.now(UTC)
+        llm = None if args.no_ai else make_digest_llm(cfg)
+        journal = Journal(cfg.journal_path, mode=cfg.mode)
+        out = run_daily_digest(cfg, journal, feed, now.date(), llm=llm, now=now, force=args.force)
+        d = out.get("digest", out)
+        print(f"digest ({out.get('source', out['status'])}): risk {d.get('risk_level')}")
+        print(d.get("summary", ""))
+    now = datetime.now(UTC)
+    print("source          last ok (UTC)      age")
+    ages = feed.staleness_minutes(now)
+    status = feed.store.status()
+    for source, age in ages.items():
+        info = status.get(source) or {}
+        last = (info.get("last_ok") or "never")[:16]
+        err = f"  last error: {info['last_error'][:80]}" if info.get("last_error") else ""
+        age_txt = "-" if age is None else f"{age:.0f} min"
+        print(f"{source:<15} {last:<18} {age_txt}{err}")
+    cover = feed.calendar.days_of_cover(now)
+    print(f"macro calendar: {len(feed.calendar.events)} events, {cover:.0f} days of cover")
+    if cover < cfg.research.calendar_warn_days:
+        print(f"  WARNING: add upcoming events to {cfg.research.calendar_file}")
+    return 0
 
 
 def cmd_export(cfg: Config, args: argparse.Namespace) -> int:
@@ -652,6 +706,7 @@ COMMANDS = {
     "mcp": cmd_mcp,
     "account": cmd_account,
     "export": cmd_export,
+    "research": cmd_research,
     "replay": cmd_replay,
 }
 

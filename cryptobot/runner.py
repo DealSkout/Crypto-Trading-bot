@@ -38,9 +38,11 @@ class Runner:
         sleep: Callable[[float], None] = time.sleep,
         flatten_on_exit: bool = True,
         guardian=None,
+        research=None,
     ) -> None:
         self.cfg = cfg
         self.guardian = guardian
+        self.research = research
         self.mode = mode
         self.engine = engine
         self.fetch_bars = fetch_bars
@@ -161,6 +163,8 @@ class Runner:
         )
 
     def shutdown(self) -> None:
+        if self.research is not None:
+            self.research.stop()
         if self.flatten_on_exit and self.engine.open:
             try:
                 self.engine._flatten("shutdown", self.clock())
@@ -232,7 +236,23 @@ class Runner:
             if outcome.get("stopped"):
                 self.guardian_stop((self.guardian.stop_info() or {}).get("reason", ""))
         self.run_trade_coach(day)
+        self.run_digest(day, now)
         self.export_store()
+
+    def run_digest(self, day, now: datetime) -> dict | None:
+        """The day's research digest (at most one LLM call). Never allowed to break the loop."""
+        if self.research is None or self.mode == "backtest":
+            return None
+        try:
+            from cryptobot.research.digest import make_digest_llm, run_daily_digest
+
+            llm = make_digest_llm(self.cfg) if self.cfg.research.digest else None
+            return run_daily_digest(
+                self.cfg, self.engine.journal, self.research, day, llm=llm, now=now
+            )
+        except Exception as e:  # pragma: no cover - research must never stop trading
+            log.warning("research digest failed: %s", e)
+            return None
 
     def export_store(self) -> None:
         """Refresh the Parquet copy of the feature store. Never allowed to break the loop."""

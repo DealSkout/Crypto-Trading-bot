@@ -143,6 +143,47 @@ class GuardianConfig:
 
 
 @dataclass
+class ResearchConfig:
+    """The market research feed (cryptobot/research). Data only: it never trades."""
+
+    enabled: bool = True
+    exchanges: list[str] = field(default_factory=lambda: ["okx", "bybit", "binance"])
+    rss_feeds: list[str] = field(
+        default_factory=lambda: [
+            "https://www.coindesk.com/arc/outboundfeeds/rss/",
+            "https://cointelegraph.com/rss",
+            "https://www.theblock.co/rss.xml",
+        ]
+    )
+    cryptopanic: bool = False  # needs CRYPTOPANIC_TOKEN in .env
+    cryptopanic_url: str = "https://cryptopanic.com/api/developer/v2/posts/"
+    calendar_file: str = "macro_calendar.yaml"
+    calendar_warn_days: int = 45
+    refresh_minutes: dict[str, float] = field(
+        default_factory=lambda: {"fear_greed": 60, "funding": 30, "open_interest": 30, "news": 20}
+    )
+    stale_after_minutes: dict[str, float] = field(
+        default_factory=lambda: {
+            "fear_greed": 2880,
+            "funding": 720,
+            "open_interest": 360,
+            "news": 720,
+        }
+    )
+    # sources whose staleness pauses new entries (prices are always required)
+    required_sources: list[str] = field(default_factory=list)
+    backfill_days: int = 400
+    digest: bool = True  # the one LLM call a day; without a key the digest uses numbers only
+    digest_model: str = "claude-haiku-5-5"
+    digest_max_tokens: int = 1200
+    max_daily_cost_usd: float = 0.05
+
+
+VALID_EXCHANGES = ("okx", "bybit", "binance")
+RESEARCH_SOURCES = ("fear_greed", "funding", "open_interest", "news")
+
+
+@dataclass
 class Config:
     mode: str = "paper"
     broker: str = "alpaca"
@@ -161,6 +202,7 @@ class Config:
     coach: CoachConfig = field(default_factory=CoachConfig)
     decider: DeciderConfig = field(default_factory=DeciderConfig)
     guardian: GuardianConfig = field(default_factory=GuardianConfig)
+    research: ResearchConfig = field(default_factory=ResearchConfig)
     poll_seconds: int = 30
     journal_path: str = "cryptobot.sqlite"
     reports_dir: str = "reports"
@@ -217,6 +259,7 @@ def from_dict(raw: dict[str, Any], path: str = "config.yaml") -> Config:
         coach=_build(CoachConfig, raw.get("coach"), "coach"),
         decider=_build(DeciderConfig, raw.get("decider"), "decider"),
         guardian=_build(GuardianConfig, raw.get("guardian"), "guardian"),
+        research=_build(ResearchConfig, raw.get("research"), "research"),
         poll_seconds=int(raw.get("poll_seconds", 30)),
         journal_path=str(raw.get("journal_path", "cryptobot.sqlite")),
         reports_dir=str(raw.get("reports_dir", "reports")),
@@ -291,6 +334,15 @@ def validate(cfg: Config) -> None:
         raise ConfigError("guardian day/halt/error limits must be >= 1")
     if not (0 <= g.min_confidence <= 1):
         raise ConfigError("guardian.min_confidence must be between 0 and 1")
+    rs = cfg.research
+    bad = [x for x in rs.exchanges if x not in VALID_EXCHANGES]
+    if bad:
+        raise ConfigError(f"research.exchanges: unknown {bad}; use {VALID_EXCHANGES}")
+    bad = [x for x in rs.required_sources if x not in RESEARCH_SOURCES]
+    if bad:
+        raise ConfigError(f"research.required_sources: unknown {bad}; use {RESEARCH_SOURCES}")
+    if not (0 <= rs.max_daily_cost_usd <= 5):
+        raise ConfigError("research.max_daily_cost_usd must be between 0 and 5")
     c = cfg.costs
     if min(c.commission, c.fee_pct, c.spread_bps, c.slippage_bps, c.stop_slippage_bps) < 0:
         raise ConfigError("costs must not be negative")
