@@ -423,3 +423,35 @@ def test_filters_skip_and_shrink_but_never_grow(cfg):
     zero, _ = run({"regime_weights": {"trending": 0.0}})
     assert not zero.open
     assert math.isfinite(q)
+
+
+def test_extra_candidates_enter_the_same_gate(cfg, monkeypatch):
+    """Cross-learning and evolution candidates are appended to the pool and
+    simulated like everything else, deduplicated by their key."""
+    from cryptobot.learning import Candidate, generate_challengers, run_learning
+    from cryptobot.registry import Registry
+
+    registry = Registry(":memory:")
+    champ = registry.sync_with_config("orb", {"range_minutes": 30, "target_r": 3})
+    labels = []
+
+    def fake_sim(candidate):
+        labels.append(candidate.label)
+        import numpy as np
+        import pandas as pd
+
+        return {
+            "candidate": candidate,
+            "label": candidate.label,
+            "daily": pd.Series(dtype=float),
+            "trades": pd.DataFrame(columns=["pnl", "r_multiple", "entry_ts"]),
+            "returns": np.zeros(0),
+        }
+
+    extra = Candidate(strategy="vwap_revert", params={"band_pct": 9.9}, filters={})
+    bars = {"BTC/USD": __import__("tests.conftest", fromlist=["x"]).bars_from_closes([100.0] * 60)}
+    try:
+        run_learning(cfg, bars, registry, simulate_fn=fake_sim, extra_candidates=[extra, extra])
+    except Exception:
+        pass  # the fake simulate output may not satisfy the full evaluate path
+    assert sum(1 for label in labels if "vwap_revert" in label and "9.9" in label) == 1

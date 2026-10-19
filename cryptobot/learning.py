@@ -508,6 +508,7 @@ def run_learning(
     simulate_fn=None,
     workers: int | None = None,
     out_dir: str | Path | None = None,
+    extra_candidates: list[Candidate] | None = None,
 ) -> dict[str, Any]:
     """One learning run. Returns the report (also written to reports/learning/)."""
     now = now or datetime.now(UTC)
@@ -520,6 +521,18 @@ def run_learning(
     start = datetime(days[0].year, days[0].month, days[0].day, tzinfo=UTC)
     available = research_coverage(cfg, research_path, start)
     cands = [Candidate.from_model(champion), *generate_challengers(cfg, champion, available)]
+    # externally sourced candidates (cross-learning, evolution) face the same gate
+    seen = {c.key() for c in cands}
+    for extra in extra_candidates or []:
+        if extra.key() in seen:
+            continue
+        seen.add(extra.key())
+        if not extra.label:
+            extra = Candidate(
+                extra.strategy, dict(extra.params), dict(extra.filters),
+                label=_label(extra.strategy, extra.params, extra.filters),
+            )
+        cands.append(extra)
     log.info("learning: %d challengers vs champion %s", len(cands) - 1, champion.id)
     if simulate_fn is None:
         sims = simulate_all(cfg, cands, bars, research_path, workers)
