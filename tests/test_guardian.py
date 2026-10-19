@@ -216,7 +216,9 @@ def test_runner_stops_completely_on_drawdown(cfg, tmp_path):
     df = bars_from_closes([100.0] * 6)
     now = {"now": df.index[1] + timedelta(minutes=5, seconds=1)}
     runner, engine = make_runner(cfg, tmp_path / "h", now, df, g)
-    runner.run_forever(max_steps=5)  # bar 2 enters; costs put equity under the peak -> stop
+    # entries fill at the next bar's open, so let each loop step advance the clock one bar
+    runner.sleep = lambda s: now.__setitem__("now", now["now"] + timedelta(minutes=5))
+    runner.run_forever(max_steps=5)  # bar 2 queues, bar 3 enters; costs dent equity -> stop
     assert g.stopped and runner.stop_requested and not engine.open
     assert runner.steps < 5
     kinds = set(j.events()["kind"])

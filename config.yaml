@@ -36,8 +36,8 @@ costs:
                                    # Check your tier on Alpaca's fee page and lower it if yours is less.
   spread_bps: 5                    # full bid-ask spread; half is paid on each side
   slippage_bps: 5                  # per side
-  stop_slippage_bps: 10            # backtests: extra slippage on stop exits (stops are polled
-                                   # every poll_seconds and closed at the market, so they fill late)
+  stop_gap_bps: 10                 # simulations: stop exits fill this far through the stop (stops
+                                   # are polled every poll_seconds and closed at the market)
 
 # How orders are sent. Alpaca crypto accepts only market, limit and stop_limit orders, with
 # time in force gtc or ioc. Exits (stops, targets, end of day) are always market orders.
@@ -48,7 +48,7 @@ orders:
   fill_timeout_seconds: 30         # an entry not filled by then is cancelled (no trade)
   backup_stop: true                # also rest a stop_limit at Alpaca behind each software stop, so a
                                    # crashed bot still has protection (cancelled before normal exits)
-  backup_stop_buffer_pct: 1.0      # how far beyond the software stop the backup sits
+  backup_stop_buffer_pct: 0        # how far beyond the software stop the backup sits (0 = at it)
 
 data:
   provider: alpaca                 # alpaca (alpaca-py crypto bars) | csv | synthetic

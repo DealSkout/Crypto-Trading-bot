@@ -120,9 +120,10 @@ class Engine:
         self.errors = 0
         self.capped_entries = 0
         self.skipped = 0
-        # Backtests fill a signal at the NEXT bar's open (a live order goes out after the bar
-        # closes, so it never gets the signal bar's close). Paper and live fill immediately.
-        self.fill_next_open = mode == "backtest"
+        # Simulated brokers fill a signal at the NEXT bar's open (a live order goes out after
+        # the bar closes, so it never gets the signal bar's close). Real brokers (Alpaca paper
+        # or live) fill the market order immediately, which is moments after the close anyway.
+        self.fill_next_open = bool(getattr(broker, "delayed_entry", False))
         self.pending: dict[str, tuple[Signal, datetime]] = {}
         self._skip_seen: set[tuple[str, str]] = set()
         # the feature store: every decision is journalled with what was known at that moment
@@ -147,6 +148,11 @@ class Engine:
             except Exception as e:  # notifications must never break trading
                 log.warning("notify failed: %s", e)
 
+    @property
+    def pending_entry(self) -> dict[str, tuple[Signal, datetime]]:
+        """Entries queued for the next bar's open (simulated brokers)."""
+        return self.pending
+
     def equity(self) -> float:
         return float(self.broker.get_equity())
 
@@ -170,6 +176,7 @@ class Engine:
             )
         self.risk.start_day(day, self.equity())
         self._skip_seen.clear()
+        self.pending.clear()  # an overnight signal is stale; strategies re-signal
         self.day_pnl = self.day_costs = 0.0
         self.day_trades = 0
         self.journal.log("day_start", f"{day} equity={self.equity():.2f}", ts=ts)
@@ -220,8 +227,10 @@ class Engine:
             )
             if decision is not None:
                 ref = decision.price
-                if decision.reason == "stop" and self.broker.name == "paper":
-                    ref = self.risk.cost_model.stop_reference(ref, trade.side == "long")
+                if decision.reason == "stop" and self.fill_next_open:  # simulated fills only
+                    ref = self.risk.cost_model.stop_exit_reference(
+                        ref, closing_long=trade.side == "long"
+                    )
                 self._exit(symbol, decision.reason, ref, ts)
             elif (
                 self.decider is not None
@@ -379,6 +388,8 @@ class Engine:
         except Exception as e:  # the journal must never stop trading
             log.warning("feature computation failed for %s: %s", symbol, e)
             feats, digest = {"error": repr(e)}, ""
+        if len(bars):  # the bar the decision was made on (a queued entry fills one bar later)
+            feats["signal_bar"] = bars.index[-1].tz_convert("UTC").isoformat()
         info = {"features": feats, "regime": str(feats.get("regime", "")), "inputs_hash": digest}
         self._info[symbol] = (id(bars), info)
         return info
@@ -407,11 +418,11 @@ class Engine:
     def _skip(self, symbol: str, why: str, sig: Signal, ts: datetime) -> None:
         """Log a refused signal once per symbol, reason and day (a strategy that keeps firing
         while blocked would otherwise write a skip on every bar)."""
+        self.skipped += 1  # every refusal counts...
         key = (symbol, why)
         if key in self._skip_seen:
-            return
+            return  # ...but is journalled once per symbol, reason and day
         self._skip_seen.add(key)
-        self.skipped += 1
         self.journal.log("skip", why, symbol=symbol, data={"signal": asdict(sig)}, ts=ts)
         self._record_decision(
             symbol,
@@ -798,36 +809,28 @@ class Engine:
 
     # ----------------------------------------------------------------------- exits
     def _place_backup_stop(self, symbol: str, trade: OpenTrade, ts: datetime) -> str:
-        """A resting stop_limit at the broker, a little beyond the software stop: protection
-        that survives a crashed or frozen bot. Cancelled before every normal exit."""
+        """A resting stop_limit at the broker at (or backup_stop_buffer_pct beyond) the software
+        stop: protection that survives a crashed or frozen bot. Cancelled, or booked if it
+        already filled, before every normal exit."""
         orders = self.cfg.orders
-        if (
-            not orders.backup_stop
-            or trade.side != "long"
-            or not getattr(self.broker, "supports_stop_limit", False)
-        ):
+        if not orders.backup_stop or not getattr(self.broker, "supports_protective_stop", False):
             return ""
         buf = orders.backup_stop_buffer_pct / 100.0
-        stop_px = trade.stop * (1 - buf)
-        limit_px = stop_px * (1 - buf)
+        long = trade.side == "long"
+        stop_px = trade.stop * (1 - buf) if long else trade.stop * (1 + buf)
         try:
-            order = self.broker.place_order(
-                symbol,
-                "sell",
-                trade.qty,
-                order_type="stop_limit",
-                limit_price=limit_px,
-                stop_price=stop_px,
+            order = self.broker.place_protective_stop(
+                symbol, trade.qty, stop_px, side="sell" if long else "buy"
             )
         except BrokerError as e:
             self.journal.log("backup_stop_failed", str(e), symbol=symbol, ts=ts)
             return ""
-        if order.status == "rejected" or not order.id:
-            self.journal.log("backup_stop_failed", order.note, symbol=symbol, ts=ts)
+        if not order.id or order.status in ("rejected", "cancelled"):
+            self.journal.log("backup_stop_failed", order.note or order.status, symbol=symbol, ts=ts)
             return ""
         self.journal.log(
             "backup_stop",
-            f"resting stop_limit {stop_px:.4f}/{limit_px:.4f} for {trade.qty}",
+            f"resting stop_limit at {stop_px:.4f} for {trade.qty}",
             symbol=symbol,
             data={"order_id": order.id},
             ts=ts,
@@ -840,14 +843,10 @@ class Engine:
         if not oid:
             return None
         try:
-            self.broker.cancel(oid)
-        except BrokerError:
-            pass  # already filled or already gone: the lookup below tells which
-        try:
-            order = self.broker.await_fill(self.broker.get_order(oid, symbol), timeout=5)
-        except (BrokerError, AttributeError):
+            return self.broker.cancel_protective(symbol)
+        except BrokerError as e:
+            self.journal.log("error", f"backup stop cancel failed: {e}", symbol=symbol)
             return None
-        return order if order.filled_qty > 0 else None
 
     def _exit(self, symbol: str, reason: str, ref_price: float, ts: datetime) -> None:
         trade = self.open.get(symbol)

@@ -81,9 +81,7 @@ class CostConfig:
     fee_pct: float = 0.25  # Alpaca crypto taker fee per side at the lowest volume tier
     spread_bps: float = 5.0
     slippage_bps: float = 5.0
-    # extra adverse slippage on software-stop exits in simulated fills: live stops are polled
-    # (every poll_seconds) and closed at the market, so they fill beyond the stop price
-    stop_slippage_bps: float = 10.0
+    stop_gap_bps: float = 10.0  # extra adverse move on simulated stop exits
 
 
 @dataclass
@@ -93,9 +91,10 @@ class OrderConfig:
     limit_offset_bps: float = 10.0  # limit price this far through the last price
     fill_timeout_seconds: float = 30.0
     # a resting stop_limit sell at Alpaca behind every software stop, so a crashed process
-    # still has protection. It sits backup_stop_buffer_pct beyond the software stop.
+    # still has protection. It sits backup_stop_buffer_pct beyond the software stop (0 = at
+    # it: the exchange then usually fires first, at a better price than a polled stop).
     backup_stop: bool = True
-    backup_stop_buffer_pct: float = 1.0
+    backup_stop_buffer_pct: float = 0.0
 
 
 @dataclass
@@ -350,8 +349,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError(f"orders.entry_type must be one of {VALID_ENTRY_TYPES}")
     if not (0 <= o.limit_offset_bps <= 200) or o.fill_timeout_seconds <= 0:
         raise ConfigError("orders: 0 <= limit_offset_bps <= 200 and fill_timeout_seconds > 0")
-    if not (0.1 <= o.backup_stop_buffer_pct <= 10):
-        raise ConfigError("orders.backup_stop_buffer_pct must be between 0.1 and 10")
+    if not (0 <= o.backup_stop_buffer_pct <= 10):
+        raise ConfigError("orders.backup_stop_buffer_pct must be between 0 and 10")
     timeframe_minutes(cfg.timeframe)
     if cfg.data.provider not in VALID_PROVIDERS:
         raise ConfigError(f"data.provider must be one of {VALID_PROVIDERS}")
@@ -417,7 +416,7 @@ def validate(cfg: Config) -> None:
     if not (0 <= rs.max_daily_cost_usd <= 5):
         raise ConfigError("research.max_daily_cost_usd must be between 0 and 5")
     c = cfg.costs
-    if min(c.commission, c.fee_pct, c.spread_bps, c.slippage_bps, c.stop_slippage_bps) < 0:
+    if min(c.commission, c.fee_pct, c.spread_bps, c.slippage_bps, c.stop_gap_bps) < 0:
         raise ConfigError("costs must not be negative")
     lc = cfg.learning
     if not (0.3 <= lc.train_fraction <= 0.9):

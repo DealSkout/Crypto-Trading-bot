@@ -203,7 +203,9 @@ def test_open_trades_keep_their_stops_during_a_pause(cfg):
     df = bars_from_closes([100.0, 100.0, 100.0, 97.0], wick=0.0)
     now = {"now": df.index[1] + timedelta(minutes=5, seconds=1)}
     runner, engine, _ = runner_for(cfg, now, df)
-    runner.step()
+    runner.step()  # the simulator queues the signal...
+    now["now"] = df.index[2] + timedelta(minutes=5, seconds=1)
+    runner.step()  # ...and fills it at the next bar's open
     assert "BTC/USD" in engine.open
     runner.calendar = MacroCalendar(
         parse_events(

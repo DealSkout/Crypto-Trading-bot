@@ -108,7 +108,9 @@ def replay_decisions(
             row["status"] = "no stored bars"
             out.append(row)
             continue
-        ts = pd.Timestamp(d["ts"]).tz_convert("UTC")
+        stored = json.loads(d["features"]) if isinstance(d["features"], str) else {}
+        # the decision was made on the signal bar (a queued entry is journalled at its fill)
+        ts = pd.Timestamp(stored.get("signal_bar") or d["ts"]).tz_convert("UTC")
         window = window_at(bars, ts, tf)
         if window.empty or window.index[-1] != ts:
             row["status"] = "bar missing from the store"
@@ -127,7 +129,6 @@ def replay_decisions(
             and _close(sig.stop, d["stop"])
             and _close(sig.target, d["target"])
         )
-        stored = json.loads(d["features"]) if isinstance(d["features"], str) else {}
         fresh = bar_features(window)
         diffs = [k for k, v in fresh.items() if k in stored and not _close(v, stored[k])]
         row["features_match"] = not diffs

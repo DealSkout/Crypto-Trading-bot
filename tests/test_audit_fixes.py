@@ -69,11 +69,25 @@ def test_backtest_entry_fills_at_the_next_bars_open_not_the_signal_close(cfg):
     assert t.stop == pytest.approx(99.0)  # the strategy's level, not re-based on the fill
 
 
-def test_paper_and_live_still_fill_immediately(cfg):
+def test_real_brokers_fill_immediately_and_the_simulator_waits_a_bar(cfg):
     df = bars_from_closes([100, 100, 101], wick=0.0)
-    engine, _ = make_engine(cfg, StubStrategy(fire_at=2, stop_pct=1.0), mode="paper")
+    real = FakeAlpaca(fee_coins=0.0)  # Alpaca paper or live: the market order fills now
+    cm = cost_model(cfg)
+    risk = RiskManager(cfg.risk, cfg.allow_short, cfg.max_entries_per_day, cost_model=cm)
+    engine = Engine(
+        cfg,
+        StubStrategy(fire_at=2, stop_pct=1.0),
+        {},
+        real,
+        risk,
+        Journal(":memory:"),
+        mode="paper",
+    )
     feed(engine, df.iloc[:2])
     assert "BTC/USD" in engine.open and not engine.pending
+    sim, _ = make_engine(cfg, StubStrategy(fire_at=2, stop_pct=1.0), mode="paper")
+    feed(sim, df.iloc[:2])
+    assert "BTC/USD" in sim.pending_entry and not sim.open
 
 
 def test_gap_through_the_stop_before_the_fill_skips_the_trade(cfg):
@@ -92,7 +106,7 @@ def test_simulated_stop_exits_pay_extra_stop_slippage(cfg):
     t = engine.trades[0]
     cm = cost_model(cfg)
     assert t.exit_reason == "stop"
-    expected = cm.fill_price(cm.stop_reference(99.0, True), False)
+    expected = cm.fill_price(cm.stop_exit_reference(99.0, closing_long=True), False)
     assert t.exit_price == pytest.approx(expected)
     assert t.exit_price < cm.fill_price(99.0, False)  # worse than a fill exactly at the stop
 
@@ -113,16 +127,19 @@ class AlwaysFires:
 
 
 def test_a_signal_blocked_all_day_is_logged_once(cfg):
-    cfg.max_entries_per_day = 1
     df = bars_from_closes([100.0] * 60, wick=0.0)
     engine, journal = make_engine(cfg, AlwaysFires(), mode="paper")
     engine.risk.max_entries_per_day = 1
-    feed(engine, df.iloc[:2])
+    feed(engine, df.iloc[:2])  # bar 1 signals, bar 2 fills at its open
+    assert "BTC/USD" in engine.open
     engine._exit("BTC/USD", "manual", 100.0, df.index[1].to_pydatetime())
-    feed(engine, df)
+    for i in range(3, len(df) + 1):  # it keeps firing for the rest of the day
+        w = df.iloc[:i]
+        w.attrs = dict(df.attrs)
+        engine.on_bar("BTC/USD", w)
     skips = journal.events(kinds=["skip"])
     assert len(skips) == 1 and "max_entries_per_day" in skips["message"].iloc[0]
-    assert engine.skipped == 1
+    assert engine.skipped > 1  # every refusal is counted, but journalled once
 
 
 # ----------------------------------------------------------------------------- ORB
@@ -158,12 +175,38 @@ def test_strategy_due_checks_agree_with_signal():
 
 
 class FakeAlpacaWithStops(FakeAlpaca):
-    supports_stop_limit = True
+    """Alpaca-like: resting protective stops through place_protective_stop/cancel_protective
+    (the same interface as AlpacaCryptoBroker)."""
+
+    supports_protective_stop = True
 
     def __init__(self, backup_fills=False):
         super().__init__(fee_coins=0.0)
         self.backup_fills = backup_fills
         self.orders: dict[str, Order] = {}
+        self.protective: dict[str, str] = {}
+
+    def place_protective_stop(self, symbol, qty, stop_price, side="sell"):
+        o = self.place_order(
+            symbol,
+            side,
+            qty,
+            order_type="stop_limit",
+            limit_price=stop_price * 0.995,
+            stop_price=stop_price,
+        )
+        self.protective[symbol] = o.id
+        return o
+
+    def cancel_protective(self, symbol):
+        oid = self.protective.pop(symbol, None)
+        if not oid:
+            return None
+        o = self.get_order(oid, symbol)
+        if o.status != "filled":
+            self.cancel(oid)
+            o = self.get_order(oid, symbol)
+        return o if o.filled_qty > 0 else None
 
     def place_order(
         self, symbol, side, qty, order_type="market", limit_price=None, stop_price=None

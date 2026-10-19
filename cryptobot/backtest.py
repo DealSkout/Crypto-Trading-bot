@@ -25,6 +25,7 @@ from cryptobot.strategies import default_params, load_strategy, strategy_name
 
 HISTORY_SESSIONS = 25  # how many sessions of history a strategy sees
 PERIODS_PER_YEAR = 365  # crypto trades every day of the year: annualise daily returns by 365
+TRADING_DAYS_PER_YEAR = PERIODS_PER_YEAR  # older name, kept for compatibility
 
 
 def cost_model(cfg: Config) -> CostModel:

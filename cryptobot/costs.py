@@ -11,18 +11,21 @@ class CostModel:
     fee_pct: float = 0.25  # exchange fee, % of notional per side (Alpaca crypto taker fee)
     spread_bps: float = 5.0  # full spread; half is paid on each side
     slippage_bps: float = 5.0  # per side
-    stop_slippage_bps: float = 10.0  # extra, on simulated software-stop exits only
+    # Extra adverse move on SIMULATED stop exits, on top of normal slippage. Live, the stop
+    # is a software stop polled every 30 s and closed with a market order, so fast moves fill
+    # beyond the stop price; this keeps backtests from assuming a perfect stop fill.
+    stop_gap_bps: float = 10.0
 
     def fill_price(self, reference: float, is_buy: bool) -> float:
         """Price actually paid/received: reference moved against us by half-spread + slippage."""
         adverse = (self.spread_bps / 2 + self.slippage_bps) / 10_000.0
         return reference * (1 + adverse) if is_buy else reference * (1 - adverse)
 
-    def stop_reference(self, stop_level: float, is_long: bool) -> float:
-        """Where a polled software stop really gets out: beyond the level by stop_slippage_bps
-        (the normal half-spread and slippage are then added by fill_price)."""
-        extra = self.stop_slippage_bps / 10_000.0
-        return stop_level * (1 - extra) if is_long else stop_level * (1 + extra)
+    def stop_exit_reference(self, reference: float, closing_long: bool) -> float:
+        """Reference price for a stop exit: pushed further through the stop before the normal
+        fill_price adjustment is applied on top."""
+        gap = self.stop_gap_bps / 10_000.0
+        return reference * (1 - gap) if closing_long else reference * (1 + gap)
 
     def fees(self, notional: float, fx: bool = True) -> float:
         """Explicit fees on one side: commission plus the percentage fee. `fx` is kept for
