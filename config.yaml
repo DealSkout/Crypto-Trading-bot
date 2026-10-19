@@ -105,4 +105,5 @@ guardian:
 poll_seconds: 30                   # how often the 24/7 loop checks prices for software stops
 journal_path: cryptobot.sqlite
 reports_dir: reports
+store_dir: store                   # Parquet copy of every decision and trade (with features), daily
 telegram: true                     # send daily summaries if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID are set

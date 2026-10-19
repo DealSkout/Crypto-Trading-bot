@@ -1,5 +1,5 @@
 """Command line: backtest | paper | live | report | coach | refit | check | review | account |
-dashboard | guardian | resume | mcp."""
+dashboard | guardian | resume | mcp | export | replay."""
 
 from __future__ import annotations
 
@@ -225,10 +225,12 @@ def run_loop(cfg: Config, mode: str, args: argparse.Namespace) -> int:
     )
     provider = args.data or cfg.data.provider
 
+    from cryptobot.backtest import HISTORY_SESSIONS
+
     def fetch(symbol: str):
-        return get_bars(
-            cfg, symbol, provider=provider, lookback_days=min(cfg.data.lookback_days, 10)
-        )
+        # the same history a backtest strategy sees (ATR etc. need it); incremental after the
+        # first call, so polling stays cheap
+        return get_bars(cfg, symbol, provider=provider, lookback_days=HISTORY_SESSIONS + 2)
 
     from cryptobot.guardian import make_guardian
 
@@ -595,7 +597,44 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mc.add_argument("--mode", choices=["paper", "live"], default=None, help="which journal")
     mc.add_argument("--read-only", action="store_true", help="leave out the stop_bot tool")
+    ex = sub.add_parser("export", help="write the journal's decisions and trades to Parquet")
+    ex.add_argument("--out", default="store", help="output folder (default: store)")
+    ex.add_argument("--mode", choices=["paper", "live", "backtest"], default=None)
+    rr = sub.add_parser("replay", help="re-run a past day's decisions from stored bars and compare")
+    rr.add_argument("--date", required=True, help="YYYY-MM-DD (UTC)")
+    rr.add_argument("--mode", choices=["paper", "live"], default=None)
+    add_data(rr)
     return p
+
+
+def cmd_export(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.store import export_store
+
+    journal = Journal(cfg.journal_path, mode=args.mode or cfg.mode)
+    for name, path in export_store(journal, args.out).items():
+        print(f"{name}: {path}")
+    return 0
+
+
+def cmd_replay(cfg: Config, args: argparse.Namespace) -> int:
+    from datetime import date as date_cls
+
+    from cryptobot.store import replay_day
+
+    day = date_cls.fromisoformat(args.date)
+    days_back = (datetime.now(UTC).date() - day).days + 30
+    bars = load_bars(cfg, args.data, days_back)
+    journal = Journal(cfg.journal_path, mode=args.mode or cfg.mode)
+    rows = replay_day(cfg, journal, day, bars, mode=args.mode or cfg.mode)
+    if not rows:
+        print(f"no enter/skip decisions journalled on {day}")
+        return 0
+    exact = sum(1 for r in rows if r.get("status") == "exact")
+    for r in rows:
+        extra = f" diffs={r['feature_diffs']}" if r.get("feature_diffs") else ""
+        print(f"{r['ts'][:16]} {r['symbol']:<9} {r['action']:<5} {r['status']}{extra}")
+    print(f"{exact} of {len(rows)} decisions replayed exactly")
+    return 0 if all(r.get("status") != "MISMATCH" for r in rows) else 1
 
 
 COMMANDS = {
@@ -612,6 +651,8 @@ COMMANDS = {
     "review": cmd_review,
     "mcp": cmd_mcp,
     "account": cmd_account,
+    "export": cmd_export,
+    "replay": cmd_replay,
 }
 
 

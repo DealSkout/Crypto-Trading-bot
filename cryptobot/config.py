@@ -164,6 +164,7 @@ class Config:
     poll_seconds: int = 30
     journal_path: str = "cryptobot.sqlite"
     reports_dir: str = "reports"
+    store_dir: str = "store"  # Parquet export of decisions/trades, refreshed after each UTC day
     telegram: bool = True
     account_currency: str = "USD"  # Alpaca accounts are in USD
     path: str = "config.yaml"
@@ -219,6 +220,7 @@ def from_dict(raw: dict[str, Any], path: str = "config.yaml") -> Config:
         poll_seconds=int(raw.get("poll_seconds", 30)),
         journal_path=str(raw.get("journal_path", "cryptobot.sqlite")),
         reports_dir=str(raw.get("reports_dir", "reports")),
+        store_dir=str(raw.get("store_dir", "store")),
         telegram=bool(raw.get("telegram", True)),
         path=path,
     )

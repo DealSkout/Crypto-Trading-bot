@@ -89,8 +89,16 @@ def write_cache(path: Path, bars: pd.DataFrame) -> None:
 # --------------------------------------------------------------------------- providers
 
 
-def fetch_alpaca(symbol: str, tf_minutes: int, days: int, client=None) -> pd.DataFrame:
-    """Crypto bars from Alpaca via alpaca-py. `client` is injectable for tests."""
+def fetch_alpaca(
+    symbol: str,
+    tf_minutes: int,
+    days: int,
+    client=None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> pd.DataFrame:
+    """Crypto bars from Alpaca via alpaca-py, from `start` (default: `days` ago) to `end`
+    (default: now). `client` is injectable for tests."""
     from alpaca.data.requests import CryptoBarsRequest
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
@@ -106,10 +114,12 @@ def fetch_alpaca(symbol: str, tf_minutes: int, days: int, client=None) -> pd.Dat
         )
     if not 1 <= tf_minutes <= 59:
         raise DataError("alpaca bars support 1-59 minute timeframes")
+    kwargs = {"end": end} if end is not None else {}
     request = CryptoBarsRequest(
         symbol_or_symbols=[symbol],
         timeframe=TimeFrame(tf_minutes, TimeFrameUnit.Minute),
-        start=datetime.now(UTC) - timedelta(days=days),
+        start=start or datetime.now(UTC) - timedelta(days=days),
+        **kwargs,
     )
     df = client.get_crypto_bars(request).df
     if df is None or df.empty:
@@ -202,6 +212,21 @@ def synthetic_bars(
 # --------------------------------------------------------------------------- entry point
 
 
+def _fetch_missing(
+    symbol: str, tf: int, days: int, cached: pd.DataFrame, cutoff: datetime, client
+) -> pd.DataFrame:
+    """Only ask Alpaca for what the cache lacks: the recent tail (with a small overlap, as the
+    last bar may have been fetched while it was still forming) and, if the cache does not reach
+    back to `cutoff`, the older head. The live loop polls this every few seconds."""
+    if cached.empty:
+        return fetch_alpaca(symbol, tf, days, client=client, start=cutoff)
+    first, last = cached.index[0].to_pydatetime(), cached.index[-1].to_pydatetime()
+    frames = [fetch_alpaca(symbol, tf, days, client=client, start=last - timedelta(minutes=3 * tf))]
+    if first - cutoff > timedelta(minutes=tf):
+        frames.append(fetch_alpaca(symbol, tf, days, client=client, start=cutoff, end=first))
+    return merge(frames)
+
+
 def get_bars(
     cfg: Config,
     symbol: str,
@@ -223,8 +248,10 @@ def get_bars(
     elif provider == "alpaca":
         path = cache_path(cfg, symbol)
         cached = read_cache(path)
+        now = now or datetime.now(UTC)
+        cutoff = now - timedelta(days=days)
         try:
-            fresh = fetch_alpaca(symbol, tf, days, client=client)
+            fresh = _fetch_missing(symbol, tf, days, cached, cutoff, client)
         except Exception as e:  # network, auth, rate limit: fall back to the cache
             if cached.empty:
                 raise DataError(
@@ -236,6 +263,7 @@ def get_bars(
         bars = merge([cached, fresh])
         if not fresh.empty:
             write_cache(path, bars)
+        bars = bars[bars.index >= pd.Timestamp(cutoff).floor("D")]
     else:
         raise DataError(f"unknown data provider {provider!r}")
 

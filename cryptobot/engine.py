@@ -12,6 +12,7 @@ Everything is written to the journal.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -25,6 +26,7 @@ from cryptobot import sessions
 from cryptobot.brokers.base import Broker, BrokerError, Order
 from cryptobot.config import Config
 from cryptobot.decider import Decider, build_context
+from cryptobot.features import decision_features, inputs_hash
 from cryptobot.journal import Journal
 from cryptobot.risk import RiskManager
 from cryptobot.strategies import Signal, due_check, strategy_name
@@ -51,6 +53,9 @@ class OpenTrade:
     reason: str
     signal_price: float = 0.0
     backup_order_id: str = ""
+    regime: str = ""
+    features: str = ""  # JSON of the features at the entry decision
+    entry_slippage_bps: float = 0.0
 
 
 @dataclass
@@ -69,6 +74,13 @@ class TradeRecord:
     costs: float
     exit_reason: str
     signal_reason: str
+    version: str = ""
+    regime: str = ""
+    signal_price: float = 0.0
+    entry_slippage_bps: float = 0.0
+    exit_slippage_bps: float = 0.0
+    fees: float = 0.0
+    features: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -113,6 +125,12 @@ class Engine:
         self.fill_next_open = mode == "backtest"
         self.pending: dict[str, tuple[Signal, datetime]] = {}
         self._skip_seen: set[tuple[str, str]] = set()
+        # the feature store: every decision is journalled with what was known at that moment
+        self.version = "config"  # the model version trading (the registry sets this)
+        self.context_providers: list = []  # regime, research snapshot: see features.py
+        self.record_decisions = True
+        self._source: dict[str, pd.DataFrame] = {}  # the bar window behind the current signal
+        self._info: dict[str, tuple[int, dict[str, Any]]] = {}
 
     # ----------------------------------------------------------------------- helpers
     def _say(self, text: str) -> None:
@@ -339,6 +357,47 @@ class Engine:
             return None
         return sig
 
+    # ----------------------------------------------------------------------- feature store
+    def _decision_info(self, symbol: str) -> dict[str, Any]:
+        """Features, regime and input fingerprint for the symbol's current signal, computed
+        once per signal and only when a decision is actually recorded."""
+        bars = self._source.get(symbol)
+        if bars is None:
+            return {"features": {}, "regime": "", "inputs_hash": ""}
+        cached = self._info.get(symbol)
+        if cached is not None and cached[0] == id(bars):
+            return cached[1]
+        try:
+            feats = decision_features(symbol, bars, self.context_providers)
+            digest = inputs_hash(bars, self.strategy_name, self.params)
+        except Exception as e:  # the journal must never stop trading
+            log.warning("feature computation failed for %s: %s", symbol, e)
+            feats, digest = {"error": repr(e)}, ""
+        info = {"features": feats, "regime": str(feats.get("regime", "")), "inputs_hash": digest}
+        self._info[symbol] = (id(bars), info)
+        return info
+
+    def _record_decision(self, symbol: str, action: str, ts: datetime, **fields: Any) -> int:
+        if not self.record_decisions:
+            return 0
+        info = self._decision_info(symbol)
+        try:
+            return self.journal.record_decision(
+                ts,
+                version=self.version,
+                strategy=self.strategy_name,
+                symbol=symbol,
+                action=action,
+                regime=info["regime"],
+                params=self.params,
+                features=info["features"],
+                inputs_hash=info["inputs_hash"],
+                **fields,
+            )
+        except Exception as e:  # pragma: no cover - bookkeeping must never stop trading
+            log.warning("decision journal write failed: %s", e)
+            return 0
+
     def _skip(self, symbol: str, why: str, sig: Signal, ts: datetime) -> None:
         """Log a refused signal once per symbol, reason and day (a strategy that keeps firing
         while blocked would otherwise write a skip on every bar)."""
@@ -348,6 +407,16 @@ class Engine:
         self._skip_seen.add(key)
         self.skipped += 1
         self.journal.log("skip", why, symbol=symbol, data={"signal": asdict(sig)}, ts=ts)
+        self._record_decision(
+            symbol,
+            "skip",
+            ts,
+            reason=why,
+            side=sig.side,
+            signal_price=sig.entry,
+            stop=sig.stop,
+            target=sig.target,
+        )
 
     def _try_enter(
         self,
@@ -428,6 +497,7 @@ class Engine:
         return Signal(sig.side, sig.entry, stop, sig.target, reason=sig.reason + " (stop capped)")
 
     def _maybe_enter(self, symbol: str, bars: pd.DataFrame, ts: datetime, mtc: float) -> None:
+        self._source[symbol] = bars  # what any decision on this bar was based on
         sig = self._strategy_signal(symbol, bars, ts)
         if self.decider is None:
             if sig is not None:
@@ -600,7 +670,28 @@ class Engine:
             reason=sig.reason,
             signal_price=float(signal_price if signal_price is not None else sig.entry),
         )
-        self.open[symbol].backup_order_id = self._place_backup_stop(symbol, self.open[symbol], ts)
+        trade = self.open[symbol]
+        ref = trade.signal_price
+        sgn = 1.0 if sig.side == "long" else -1.0
+        trade.entry_slippage_bps = (price - ref) / ref * 10_000.0 * sgn if ref > 0 else 0.0
+        info = self._decision_info(symbol)
+        trade.regime = info["regime"]
+        trade.features = json.dumps(info["features"], sort_keys=True, default=str)
+        self._record_decision(
+            symbol,
+            "enter",
+            ts,
+            reason=sig.reason,
+            side=sig.side,
+            signal_price=ref,
+            stop=sig.stop,
+            target=sig.target,
+            qty=qty,
+            fill_price=price,
+            slippage_bps=trade.entry_slippage_bps,
+            fees=order.fees,
+        )
+        trade.backup_order_id = self._place_backup_stop(symbol, trade, ts)
         self.risk.record_entry(symbol)
         self.journal.log(
             "entry",
@@ -727,9 +818,44 @@ class Engine:
             costs=explicit + implicit,
             exit_reason=reason,
             signal_reason=trade.reason,
+            version=self.version,
+            regime=trade.regime,
+            signal_price=trade.signal_price,
+            entry_slippage_bps=trade.entry_slippage_bps,
+            exit_slippage_bps=(
+                (ref_price - exit_price) / ref_price * 10_000.0 * direction
+                if ref_price > 0
+                else 0.0
+            ),
+            fees=explicit,
+            features=trade.features,
         )
         self.trades.append(rec)
-        self.journal.record_trade(rec.to_dict(), strategy=self.strategy_name)
+        trade_id = self.journal.record_trade(rec.to_dict(), strategy=self.strategy_name)
+        if self.record_decisions:
+            try:
+                self.journal.record_decision(
+                    ts,
+                    version=self.version,
+                    strategy=self.strategy_name,
+                    symbol=symbol,
+                    action="exit",
+                    reason=reason,
+                    side=trade.side,
+                    signal_price=ref_price,
+                    stop=trade.stop,
+                    target=trade.target,
+                    qty=trade.qty,
+                    fill_price=exit_price,
+                    slippage_bps=rec.exit_slippage_bps,
+                    fees=order.fees,
+                    pnl=pnl,
+                    regime=trade.regime,
+                    params=self.params,
+                    trade_id=trade_id,
+                )
+            except Exception as e:  # pragma: no cover
+                log.warning("decision journal write failed: %s", e)
         self.journal.log(
             "exit",
             f"{reason}: {trade.side} {trade.qty} {symbol} @ {exit_price:.4f}"

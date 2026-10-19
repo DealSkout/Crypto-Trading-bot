@@ -30,6 +30,7 @@ def base_raw(tmp_path) -> dict:
         },
         "learning": {"min_oos_trades": 5, "min_sharpe_gain": 0.1},
         "reports_dir": str(tmp_path / "reports"),
+        "store_dir": str(tmp_path / "store"),
         "journal_path": str(tmp_path / "journal.sqlite"),
         "coach": {"dir": str(tmp_path / "coach")},
         "telegram": False,

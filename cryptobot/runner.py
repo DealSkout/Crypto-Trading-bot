@@ -232,6 +232,16 @@ class Runner:
             if outcome.get("stopped"):
                 self.guardian_stop((self.guardian.stop_info() or {}).get("reason", ""))
         self.run_trade_coach(day)
+        self.export_store()
+
+    def export_store(self) -> None:
+        """Refresh the Parquet copy of the feature store. Never allowed to break the loop."""
+        try:
+            from cryptobot.store import export_store
+
+            export_store(self.engine.journal, self.cfg.store_dir)
+        except Exception as e:  # pragma: no cover - bookkeeping only
+            log.warning("feature store export failed: %s", e)
 
     def run_trade_coach(self, day) -> None:
         """The daily trade review, after the close. Never allowed to break the loop."""
