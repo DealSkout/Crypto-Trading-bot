@@ -51,12 +51,14 @@ def test_runner_feeds_new_bars_and_ticks(cfg):
     now = {"now": df.index[1] + timedelta(minutes=5, seconds=1)}  # bars 0 and 1 complete
     runner, engine, seen = make_runner(cfg, now, df)
     assert runner.step() is True
-    assert "BTC/USD" in engine.open and runner.last_bar["BTC/USD"] == df.index[1]
+    assert "BTC/USD" in engine.pending_entry  # entries fill at the NEXT bar's open
+    assert "BTC/USD" not in engine.open and runner.last_bar["BTC/USD"] == df.index[1]
     runner.step()  # same bar -> tick only
     assert runner.last_bar["BTC/USD"] == df.index[1] and len(seen) == 2
     now["now"] = df.index[2] + timedelta(minutes=5, seconds=1)
     runner.step()
     assert runner.last_bar["BTC/USD"] == df.index[2]
+    assert "BTC/USD" in engine.open  # the queued entry filled at this bar's open
     assert runner.summarised is None  # crypto never closes: no summary mid-day
     now["now"] = df.index[4] + timedelta(minutes=5, seconds=1)  # first bar of the next UTC day
     assert runner.step() is True

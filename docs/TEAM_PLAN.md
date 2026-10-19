@@ -66,6 +66,12 @@ What this means, plainly:
   signal bar's close rather than the next open, and stop exits fill at the stop
   price + 5 bps, while the live stop is a 30 s software stop closed by market
   order. Real results would likely be slightly worse still.
+- **Post-Section-0 update:** with next-open entry fills, pessimistic stop fills
+  (stop_gap_bps 10) and 365-day annualisation, the same window reads: Bot 1
+  -37.3% (Sharpe-365 -12.49, Sortino -21.99, DD -37.5%), buy-and-hold +41.6%
+  (Sharpe-365 2.84), random -70.6%. The old simulator flattered the bot by
+  about 5 points over 110 days. These corrected figures are the baseline the
+  team is judged against.
 - Quirk to document: `backtest --days N` controls how much data is fetched, but
   the run then uses the whole parquet cache (it grows forever by design), so the
   window above is the canonical one.

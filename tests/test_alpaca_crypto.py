@@ -158,3 +158,40 @@ def test_unfilled_order_times_out_and_flatten_cancels_then_sells():
     slow = broker(FakeTradingClient(fill=False))
     pending = slow.await_fill(slow.place_order("BTC/USD", "buy", 1), timeout=0.01)
     assert not pending.is_done
+
+
+def test_protective_stop_places_cancels_and_reports_a_racing_fill():
+    client = FakeTradingClient(
+        positions=[NS(symbol="BTCUSD", qty="0.5", asset_class="crypto", avg_entry_price="100")],
+        fill=False,
+    )
+    b = broker(client)
+    order = b.place_protective_stop("BTC/USD", 0.5, 95.0, side="sell")
+    assert order.id and isinstance(client.submitted[-1], StopLimitOrderRequest)
+    req = client.submitted[-1]
+    assert float(req.stop_price) == pytest.approx(95.0)
+    assert float(req.limit_price) == pytest.approx(95.0 * (1 - b.PROTECTIVE_LIMIT_GAP))
+
+    # not filled: cancel_protective cancels and returns None
+    assert b.cancel_protective("BTC/USD") is None
+    assert client.cancelled == [order.id]
+    # idempotent once cleared
+    assert b.cancel_protective("BTC/USD") is None
+
+    # filled at the exchange before we could cancel: the fill comes back for booking
+    order2 = b.place_protective_stop("BTC/USD", 0.5, 95.0, side="sell")
+    client.fill = True
+    filled = b.cancel_protective("BTC/USD")
+    assert filled is not None and filled.id == order2.id
+    assert filled.filled_qty == pytest.approx(0.5)
+
+
+def test_placing_a_new_protective_stop_replaces_the_old_one():
+    client = FakeTradingClient(
+        positions=[NS(symbol="BTCUSD", qty="0.5", asset_class="crypto", avg_entry_price="100")],
+        fill=False,
+    )
+    b = broker(client)
+    first = b.place_protective_stop("BTC/USD", 0.5, 95.0)
+    b.place_protective_stop("BTC/USD", 0.5, 96.0)
+    assert client.cancelled == [first.id]  # the stale stop was cancelled first

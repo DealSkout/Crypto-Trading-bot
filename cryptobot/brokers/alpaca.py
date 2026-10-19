@@ -61,6 +61,11 @@ class AlpacaCryptoBroker(Broker):
     supports_fractional = True
     qty_decimals = 9
     supports_limit = True
+    supports_protective_stop = True  # resting stop_limit survives a crashed process
+    delayed_entry = False  # live market orders fill moments after the bar closes anyway
+
+    # the protective limit sits this far through the stop so a fast move still fills
+    PROTECTIVE_LIMIT_GAP = 0.005
 
     def __init__(
         self,
@@ -84,6 +89,7 @@ class AlpacaCryptoBroker(Broker):
             client = TradingClient(api_key, api_secret, paper=not live)
         self.client = client
         self._assets: dict[str, tuple[float, float]] = {}
+        self._protective: dict[str, str] = {}  # symbol -> resting stop-limit order id
 
     # plumbing -----------------------------------------------------------------------------
     def _call(self, what: str, fn, *args, **kwargs):
@@ -238,6 +244,39 @@ class AlpacaCryptoBroker(Broker):
 
     def get_order(self, order_id: str, symbol: str = "") -> Order:
         return self._to_order(self._call("order lookup", self.client.get_order_by_id, order_id))
+
+    # protective stop ----------------------------------------------------------------------
+    def place_protective_stop(
+        self, symbol: str, qty: float, stop_price: float, side: str = "sell"
+    ) -> Order:
+        """A resting stop_limit at the exchange as a backstop for the software stop, so a
+        crashed process still has a stop. At most one per symbol."""
+        symbol = normalize(symbol)
+        self.cancel_protective(symbol)
+        gap = self.PROTECTIVE_LIMIT_GAP
+        limit = stop_price * (1 - gap) if side == "sell" else stop_price * (1 + gap)
+        order = self.place_order(
+            symbol, side, qty, order_type="stop_limit", limit_price=limit, stop_price=stop_price
+        )
+        if order.id and order.status not in ("rejected", "cancelled"):
+            self._protective[symbol] = order.id
+        return order
+
+    def cancel_protective(self, symbol: str) -> Order | None:
+        """Cancels the symbol's resting stop. Returns the Order if it already (partly)
+        filled at the exchange, so the engine can book that exit instead of selling twice."""
+        symbol = normalize(symbol)
+        order_id = self._protective.pop(symbol, None)
+        if not order_id:
+            return None
+        current = self.get_order(order_id, symbol)
+        if not current.is_done:
+            try:
+                self.cancel(order_id)
+            except BrokerError:
+                pass  # a cancel can race the fill; the re-check below decides
+            current = self.get_order(order_id, symbol)
+        return current if current.filled_qty > 0 else None
 
     def await_fill(self, order: Order, timeout: float = 30.0) -> Order:
         if order.is_done or not order.id:

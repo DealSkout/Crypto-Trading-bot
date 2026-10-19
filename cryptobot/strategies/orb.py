@@ -21,16 +21,29 @@ PARAM_GRID = {"range_minutes": [5, 15, 30], "target_r": [3, 10]}
 def signal(bars: pd.DataFrame, params: dict) -> Signal | None:
     p = {**DEFAULT_PARAMS, **(params or {})}
     today = today_bars(bars)
-    n = max(1, round(int(p["range_minutes"]) / bar_minutes(bars)))
-    if len(today) != n:  # fire exactly once, when the opening range has just completed
+    if today.empty:
         return None
-    rng = today.iloc[:n]
+    # Work from TIMESTAMPS, not bar counts: Alpaca omits minute bars with no trades, so
+    # counting bars shifts or stretches the range. The range is every bar ENDING at or
+    # before session open + range_minutes; fire exactly once, on the first completed bar
+    # that closes at or beyond that boundary (even if the boundary bar itself is missing).
+    tf = pd.Timedelta(minutes=bar_minutes(bars))
+    session_open = today.index[-1].normalize()
+    range_end = session_open + pd.Timedelta(minutes=int(p["range_minutes"]))
+    ends = today.index + tf
+    if ends[-1] < range_end:  # the range is still forming
+        return None
+    if len(today) > 1 and ends[-2] >= range_end:  # already completed on an earlier bar
+        return None
+    rng = today[ends <= range_end]
+    if rng.empty:  # no trades at all during the opening range
+        return None
     first_open = float(rng["open"].iloc[0])
-    last_close = float(rng["close"].iloc[-1])
-    if last_close == first_open:
+    range_close = float(rng["close"].iloc[-1])
+    if range_close == first_open:
         return None
-    side = "long" if last_close > first_open else "short"
-    entry = last_close
+    side = "long" if range_close > first_open else "short"
+    entry = float(today["close"].iloc[-1])
     dist = entry - float(rng["low"].min()) if side == "long" else float(rng["high"].max()) - entry
     atr = daily_atr(bars, int(p["atr_days"]))
     if atr:

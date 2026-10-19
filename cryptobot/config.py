@@ -55,6 +55,7 @@ class CostConfig:
     fee_pct: float = 0.25  # Alpaca crypto taker fee per side at the lowest volume tier
     spread_bps: float = 5.0
     slippage_bps: float = 5.0
+    stop_gap_bps: float = 10.0  # extra adverse move on simulated stop exits
 
 
 @dataclass

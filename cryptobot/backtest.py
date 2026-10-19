@@ -24,7 +24,7 @@ from cryptobot.risk import RiskManager
 from cryptobot.strategies import default_params, load_strategy, strategy_name
 
 HISTORY_SESSIONS = 25  # how many sessions of history a strategy sees
-TRADING_DAYS_PER_YEAR = 252
+TRADING_DAYS_PER_YEAR = 365  # crypto trades every day; 252 understates Sharpe by ~17%
 
 
 def cost_model(cfg: Config) -> CostModel:
@@ -208,9 +208,17 @@ def compute_metrics(
 ) -> dict[str, Any]:
     final = float(equity.iloc[-1]) if len(equity) else float(starting_cash)
     daily = equity.groupby(equity.index.normalize()).last() if len(equity) else equity
+    trading_days = int(len(daily))
+    if len(daily):
+        # anchor at starting cash the day before, so the first day's return counts too
+        day0 = daily.index[0] - pd.Timedelta(days=1)
+        daily = pd.concat([pd.Series([float(starting_cash)], index=[day0]), daily])
     rets = daily.pct_change().dropna()
     std = float(rets.std(ddof=1)) if len(rets) > 1 else 0.0
     sharpe = float(rets.mean()) / std * np.sqrt(TRADING_DAYS_PER_YEAR) if std > 0 else 0.0
+    downside = rets[rets < 0]
+    dstd = float(downside.std(ddof=1)) if len(downside) > 1 else 0.0
+    sortino = float(rets.mean()) / dstd * np.sqrt(TRADING_DAYS_PER_YEAR) if dstd > 0 else 0.0
     running_max = equity.cummax() if len(equity) else equity
     drawdown = float(((equity / running_max) - 1.0).min() * 100.0) if len(equity) else 0.0
     n = int(len(trades))
@@ -226,13 +234,14 @@ def compute_metrics(
         "final_equity": final,
         "max_drawdown_pct": drawdown,
         "sharpe": float(sharpe),
+        "sortino": float(sortino),
         "n_trades": n,
         "win_rate_pct": float((pnl > 0).mean() * 100.0) if n else 0.0,
         "avg_r": float(trades["r_multiple"].astype(float).mean()) if n else 0.0,
         "avg_pnl": float(pnl.mean()) if n else 0.0,
         "profit_factor": profit_factor,
         "total_costs": float(trades["costs"].astype(float).sum()) if n else 0.0,
-        "trading_days": int(len(daily)),
+        "trading_days": trading_days,
     }
 
 

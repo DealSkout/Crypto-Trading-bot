@@ -16,6 +16,7 @@ class PaperBroker(Broker):
     name = "paper"
     supports_fractional = True
     qty_decimals = 4
+    delayed_entry = True  # the engine fills queued entries at the next bar's open
 
     def __init__(
         self,

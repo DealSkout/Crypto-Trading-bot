@@ -98,6 +98,10 @@ class Engine:
         self.trades: list[TradeRecord] = []
         self.equity_curve: list[tuple[datetime, float]] = []
         self.last_prices: dict[str, float] = {}
+        # Simulated brokers fill entries at the NEXT bar's open (live market orders fill
+        # moments after the bar closes anyway, so this keeps backtests honest).
+        self.pending_entry: dict[str, tuple[Signal, datetime]] = {}
+        self._skips_logged: set[tuple[str, Any, str]] = set()
         self.day_pnl = 0.0
         self.day_costs = 0.0
         self.day_trades = 0
@@ -138,6 +142,8 @@ class Engine:
         self.risk.start_day(day, self.equity())
         self.day_pnl = self.day_costs = 0.0
         self.day_trades = 0
+        self.pending_entry.clear()  # an overnight signal is stale; strategies re-signal
+        self._skips_logged.clear()
         self.journal.log("day_start", f"{day} equity={self.equity():.2f}", ts=ts)
 
     # ----------------------------------------------------------------------- main hooks
@@ -154,6 +160,9 @@ class Engine:
         price = float(bar["close"])
         self.broker.mark(symbol, price, ts)
         self.last_prices[symbol] = price
+
+        mtc = sessions.minutes_to_close(market, bar_end)
+        self._fill_pending(symbol, bar, ts, mtc)
 
         trade = self.open.get(symbol)
         if trade is not None:
@@ -182,7 +191,6 @@ class Engine:
             )
             self._flatten("daily_loss", ts)
 
-        mtc = sessions.minutes_to_close(market, bar_end)
         if self.risk.should_flatten(mtc):
             same_market = [s for s in self.open if sessions.market_for(s) is market]
             if same_market:
@@ -292,12 +300,22 @@ class Engine:
             return None
         return sig
 
+    def _log_skip(self, symbol: str, why: str, sig: Signal | None, ts: datetime) -> None:
+        """Counts every skip, but journals each (symbol, day, reason) only once so a filter
+        that blocks all day cannot flood the journal with thousands of identical rows."""
+        self.skipped += 1
+        key = (symbol, self.risk.state.day, why)
+        if key in self._skips_logged:
+            return
+        self._skips_logged.add(key)
+        data = {"signal": asdict(sig)} if sig is not None else None
+        self.journal.log("skip", why, symbol=symbol, data=data, ts=ts)
+
     def _try_enter(self, symbol: str, sig: Signal, ts: datetime, mtc: float) -> bool:
         sig = self._cap_stop(symbol, sig, ts)
         ok, why = self.risk.can_enter(symbol, sig.side, len(self.open), mtc)
         if not ok:
-            self.skipped += 1
-            self.journal.log("skip", why, symbol=symbol, data={"signal": asdict(sig)}, ts=ts)
+            self._log_skip(symbol, why, sig, ts)
             return False
         qty, why = self.risk.position_size(
             self.equity(),
@@ -309,8 +327,7 @@ class Engine:
             open_exposure=self.open_exposure(),
         )
         if qty <= 0:
-            self.skipped += 1
-            self.journal.log("skip", why, symbol=symbol, data={"signal": asdict(sig)}, ts=ts)
+            self._log_skip(symbol, why, sig, ts)
             return False
         if "capped" in why:
             self.capped_entries += 1
@@ -335,10 +352,53 @@ class Engine:
     def _maybe_enter(self, symbol: str, bars: pd.DataFrame, ts: datetime, mtc: float) -> None:
         sig = self._strategy_signal(symbol, bars, ts)
         if self.decider is None:
-            if sig is not None:
-                self._try_enter(symbol, sig, ts, mtc)
+            if sig is None:
+                return
+            if getattr(self.broker, "delayed_entry", False):
+                # Simulated fills happen at the NEXT bar's open. Pre-check entry rules now so
+                # an impossible signal (near the close, halted, position open) is reported at
+                # signal time instead of silently queueing.
+                ok, why = self.risk.can_enter(symbol, sig.side, len(self.open), mtc)
+                if not ok:
+                    self._log_skip(symbol, why, sig, ts)
+                    return
+                self.pending_entry[symbol] = (sig, ts)
+                self.journal.log(
+                    "signal_queued",
+                    f"{sig.reason} (fills at the next bar's open)",
+                    symbol=symbol,
+                    data=asdict(sig),
+                    ts=ts,
+                )
+                return
+            self._try_enter(symbol, sig, ts, mtc)
             return
         self._llm_entry(symbol, bars, ts, mtc, sig)
+
+    def _fill_pending(self, symbol: str, bar, ts: datetime, mtc: float) -> None:
+        """Entry queued on the previous bar fills at THIS bar's open (simulated brokers)."""
+        pending = self.pending_entry.pop(symbol, None)
+        if pending is None:
+            return
+        sig, _sig_ts = pending
+        if self.risk.state.halted:
+            self._log_skip(symbol, "halted before the queued entry could fill", sig, ts)
+            return
+        open_px = float(bar["open"])
+        if (sig.side == "long" and open_px <= sig.stop) or (
+            sig.side == "short" and open_px >= sig.stop
+        ):
+            self._log_skip(symbol, "gapped through the stop before entry; abandoned", sig, ts)
+            return
+        if sig.target is not None and (
+            (sig.side == "long" and open_px >= sig.target)
+            or (sig.side == "short" and open_px <= sig.target)
+        ):
+            self._log_skip(symbol, "gapped through the target before entry; abandoned", sig, ts)
+            return
+        filled_sig = Signal(sig.side, open_px, sig.stop, sig.target, reason=sig.reason)
+        self.broker.set_exec_price(symbol, open_px)
+        self._try_enter(symbol, filled_sig, ts, mtc)
 
     # ----------------------------------------------------------------------- LLM decider
     def _decision_context(self, symbol: str, bars: pd.DataFrame, sig: Signal | None, mtc: float):
@@ -497,6 +557,16 @@ class Engine:
             reason=sig.reason,
         )
         self.risk.record_entry(symbol)
+        if getattr(self.broker, "supports_protective_stop", False):
+            try:
+                # resting stop-limit at the exchange: survives a crashed process
+                self.broker.place_protective_stop(
+                    symbol, qty, sig.stop, side="sell" if sig.side == "long" else "buy"
+                )
+            except BrokerError as e:
+                self.journal.log(
+                    "error", f"protective stop not placed: {e}", symbol=symbol, ts=ts
+                )
         self.journal.log(
             "entry",
             f"{sig.side} {qty} {symbol} @ {price:.4f} stop {sig.stop:.4f}"
@@ -514,16 +584,33 @@ class Engine:
         if trade is None:
             return
         side = "sell" if trade.side == "long" else "buy"
-        self.broker.set_exec_price(symbol, ref_price)
-        try:
-            order = self.broker.place_order(symbol, side, trade.qty)
-            order = self.broker.await_fill(order)
-        except BrokerError as e:
-            self.errors += 1
-            self.journal.log("order_rejected", f"exit failed: {e}", symbol=symbol, ts=ts)
-            if self.mode == "live":
-                raise EngineError(f"exit order failed in live mode: {e}") from e
-            return
+        if reason == "stop" and getattr(self.broker, "delayed_entry", False):
+            # software stops fill late in fast moves; push the simulated fill through the stop
+            cm = getattr(self.risk, "cost_model", None)
+            if cm is not None:
+                ref_price = cm.stop_exit_reference(ref_price, closing_long=trade.side == "long")
+        order = None
+        if getattr(self.broker, "supports_protective_stop", False):
+            try:
+                # if the resting stop-limit already executed at the exchange, use that fill
+                order = self.broker.cancel_protective(symbol)
+            except BrokerError as e:
+                self.journal.log(
+                    "error", f"protective stop cancel failed: {e}", symbol=symbol, ts=ts
+                )
+        if order is not None and order.filled_qty > 0:
+            reason = "stop_resting"
+        else:
+            self.broker.set_exec_price(symbol, ref_price)
+            try:
+                order = self.broker.place_order(symbol, side, trade.qty)
+                order = self.broker.await_fill(order)
+            except BrokerError as e:
+                self.errors += 1
+                self.journal.log("order_rejected", f"exit failed: {e}", symbol=symbol, ts=ts)
+                if self.mode == "live":
+                    raise EngineError(f"exit order failed in live mode: {e}") from e
+                return
         if order.status == "rejected" or order.filled_qty <= 0:
             self.errors += 1
             self.journal.log(
