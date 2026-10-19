@@ -3,7 +3,7 @@
 mode: paper              # paper | live   (live also needs CRYPTOBOT_LIVE_CONFIRM=yes in .env)
 broker: alpaca           # alpaca | paper   (paper = built-in simulator; with mode: paper, alpaca trades
                          # your Alpaca PAPER account. Give this bot its own paper account.)
-symbols: [BTC/USD, ETH/USD]   # USD crypto pairs (USD, USDT or USDC quotes). Long-only.
+symbols: [BTC/USD, ETH/USD, SOL/USD]   # USD crypto pairs (USD, USDT or USDC quotes). Long-only.
 timeframe: 5m            # 1m | 5m | 15m
 strategy: orb            # orb | intraday_momentum | vwap_revert   (the "session" is the UTC day)
 params: {range_minutes: 30, target_r: 3}
@@ -25,6 +25,8 @@ costs:
                                    # Check your tier on Alpaca's fee page and lower it if yours is less.
   spread_bps: 5                    # full bid-ask spread; half is paid on each side
   slippage_bps: 5                  # per side
+  stop_slippage_bps: 10            # backtests: extra slippage on stop exits (stops are polled
+                                   # every poll_seconds and closed at the market, so they fill late)
 
 # How orders are sent. Alpaca crypto accepts only market, limit and stop_limit orders, with
 # time in force gtc or ioc. Exits (stops, targets, end of day) are always market orders.
@@ -33,10 +35,13 @@ orders:
   entry_type: market               # market | limit (a marketable limit limit_offset_bps through the price)
   limit_offset_bps: 10
   fill_timeout_seconds: 30         # an entry not filled by then is cancelled (no trade)
+  backup_stop: true                # also rest a stop_limit at Alpaca behind each software stop, so a
+                                   # crashed bot still has protection (cancelled before normal exits)
+  backup_stop_buffer_pct: 1.0      # how far beyond the software stop the backup sits
 
 data:
   provider: alpaca                 # alpaca (alpaca-py crypto bars) | csv | synthetic
-  lookback_days: 60
+  lookback_days: 365              # a year of 5m bars: the learning loop needs 50+ out-of-sample trades
   cache_dir: cache
   csv_dir: data
 
@@ -91,7 +96,7 @@ guardian:
   min_trades_for_judgement: 10
   expected_range_r: 1.0            # average R this far below the backtest's: stop
   provider: claude                 # AI reviewer: claude | ollama | none (needs ANTHROPIC_API_KEY; the rules apply without it)
-  model: claude-opus-5-5
+  model: claude-haiku-5-5          # one short review a day: Haiku is plenty and costs far less
   ollama_model: llama3.1:8b
   min_confidence: 0.7              # the AI's stop needs at least this confidence
   max_daily_cost_usd: 0.50

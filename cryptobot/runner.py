@@ -92,6 +92,7 @@ class Runner:
                 " `python -m cryptobot resume` after reviewing."
             )
             return
+        self.reconcile_on_start()
         if self.guardian is not None:  # the starting equity is the first peak
             self.guardian.check_equity(self.engine.equity(), self.clock())
         self.say(
@@ -128,6 +129,36 @@ class Runner:
                 self.sleep(self.cfg.poll_seconds if active else 60.0)
         finally:
             self.shutdown()
+
+    def reconcile_on_start(self) -> None:
+        """The bot day-trades and always starts flat. A position or order already at the
+        broker means the last run died without flattening (a backup stop may still be resting
+        there): cancel and close it all, and say so."""
+        broker = self.engine.broker
+        if broker.name == "paper":
+            return
+        try:
+            positions, orders = broker.get_positions(), broker.open_orders()
+        except BrokerError as e:
+            self.journal.log("error", f"startup reconcile could not read the account: {e}")
+            return
+        if not positions and not orders:
+            return
+        held = ", ".join(f"{p.symbol} {p.qty:g}" for p in positions) or "none"
+        try:
+            broker.flatten_all()
+        except BrokerError as e:
+            self.journal.log("error", f"startup flatten failed: {e}")
+            if self.mode == "live":
+                raise
+        self.journal.log(
+            "startup_flatten",
+            f"left over from the last run: positions {held}; {len(orders)} open order(s)",
+        )
+        self.say(
+            f"Startup: found positions ({held}) and {len(orders)} open order(s) left over from"
+            " the last run. Cancelled and flattened them; the bot starts flat."
+        )
 
     def shutdown(self) -> None:
         if self.flatten_on_exit and self.engine.open:

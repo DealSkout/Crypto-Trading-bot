@@ -55,6 +55,9 @@ class CostConfig:
     fee_pct: float = 0.25  # Alpaca crypto taker fee per side at the lowest volume tier
     spread_bps: float = 5.0
     slippage_bps: float = 5.0
+    # extra adverse slippage on software-stop exits in simulated fills: live stops are polled
+    # (every poll_seconds) and closed at the market, so they fill beyond the stop price
+    stop_slippage_bps: float = 10.0
 
 
 @dataclass
@@ -63,12 +66,16 @@ class OrderConfig:
     entry_type: str = "market"  # market | limit (a marketable limit, see limit_offset_bps)
     limit_offset_bps: float = 10.0  # limit price this far through the last price
     fill_timeout_seconds: float = 30.0
+    # a resting stop_limit sell at Alpaca behind every software stop, so a crashed process
+    # still has protection. It sits backup_stop_buffer_pct beyond the software stop.
+    backup_stop: bool = True
+    backup_stop_buffer_pct: float = 1.0
 
 
 @dataclass
 class DataConfig:
     provider: str = "alpaca"
-    lookback_days: int = 60
+    lookback_days: int = 365
     cache_dir: str = "cache"
     csv_dir: str = "data"
 
@@ -127,7 +134,7 @@ class GuardianConfig:
     min_trades_for_judgement: int = 10
     expected_range_r: float = 1.0
     provider: str = "claude"  # none | claude | ollama; it can only stop, never resume
-    model: str = "claude-opus-5-5"
+    model: str = "claude-haiku-5-5"
     ollama_model: str = "llama3.1:8b"
     min_confidence: float = 0.7
     max_daily_cost_usd: float = 0.5
@@ -139,7 +146,7 @@ class GuardianConfig:
 class Config:
     mode: str = "paper"
     broker: str = "alpaca"
-    symbols: list[str] = field(default_factory=lambda: ["BTC/USD", "ETH/USD"])
+    symbols: list[str] = field(default_factory=lambda: ["BTC/USD", "ETH/USD", "SOL/USD"])
     timeframe: str = "5m"
     strategy: str = "orb"
     params: dict[str, Any] = field(default_factory=dict)
@@ -238,6 +245,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError(f"orders.entry_type must be one of {VALID_ENTRY_TYPES}")
     if not (0 <= o.limit_offset_bps <= 200) or o.fill_timeout_seconds <= 0:
         raise ConfigError("orders: 0 <= limit_offset_bps <= 200 and fill_timeout_seconds > 0")
+    if not (0.1 <= o.backup_stop_buffer_pct <= 10):
+        raise ConfigError("orders.backup_stop_buffer_pct must be between 0.1 and 10")
     timeframe_minutes(cfg.timeframe)
     if cfg.data.provider not in VALID_PROVIDERS:
         raise ConfigError(f"data.provider must be one of {VALID_PROVIDERS}")
@@ -281,7 +290,7 @@ def validate(cfg: Config) -> None:
     if not (0 <= g.min_confidence <= 1):
         raise ConfigError("guardian.min_confidence must be between 0 and 1")
     c = cfg.costs
-    if min(c.commission, c.fee_pct, c.spread_bps, c.slippage_bps) < 0:
+    if min(c.commission, c.fee_pct, c.spread_bps, c.slippage_bps, c.stop_slippage_bps) < 0:
         raise ConfigError("costs must not be negative")
     if not (0.3 <= cfg.learning.train_fraction <= 0.9):
         raise ConfigError("learning.train_fraction must be between 0.3 and 0.9")

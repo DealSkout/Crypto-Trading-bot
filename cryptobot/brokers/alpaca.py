@@ -61,6 +61,7 @@ class AlpacaCryptoBroker(Broker):
     supports_fractional = True
     qty_decimals = 9
     supports_limit = True
+    supports_stop_limit = True
 
     def __init__(
         self,

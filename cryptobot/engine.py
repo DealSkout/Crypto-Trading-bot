@@ -13,6 +13,7 @@ Everything is written to the journal.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from types import ModuleType
@@ -21,12 +22,12 @@ from typing import Any
 import pandas as pd
 
 from cryptobot import sessions
-from cryptobot.brokers.base import Broker, BrokerError
+from cryptobot.brokers.base import Broker, BrokerError, Order
 from cryptobot.config import Config
 from cryptobot.decider import Decider, build_context
 from cryptobot.journal import Journal
 from cryptobot.risk import RiskManager
-from cryptobot.strategies import Signal, strategy_name
+from cryptobot.strategies import Signal, due_check, strategy_name
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +49,8 @@ class OpenTrade:
     implicit_cost: float
     risk_per_unit: float
     reason: str
+    signal_price: float = 0.0
+    backup_order_id: str = ""
 
 
 @dataclass
@@ -88,6 +91,7 @@ class Engine:
         self.decider = decider
         self.strategy = strategy
         self.strategy_name = strategy_name(strategy)
+        self._due_fn = due_check(strategy)
         self.params = dict(params)
         self.broker = broker
         self.risk = risk
@@ -104,6 +108,11 @@ class Engine:
         self.errors = 0
         self.capped_entries = 0
         self.skipped = 0
+        # Backtests fill a signal at the NEXT bar's open (a live order goes out after the bar
+        # closes, so it never gets the signal bar's close). Paper and live fill immediately.
+        self.fill_next_open = mode == "backtest"
+        self.pending: dict[str, tuple[Signal, datetime]] = {}
+        self._skip_seen: set[tuple[str, str]] = set()
 
     # ----------------------------------------------------------------------- helpers
     def _say(self, text: str) -> None:
@@ -136,50 +145,74 @@ class Engine:
                 self.risk.state.halted,
             )
         self.risk.start_day(day, self.equity())
+        self._skip_seen.clear()
         self.day_pnl = self.day_costs = 0.0
         self.day_trades = 0
         self.journal.log("day_start", f"{day} equity={self.equity():.2f}", ts=ts)
 
     # ----------------------------------------------------------------------- main hooks
     def on_bar(self, symbol: str, bars: pd.DataFrame) -> None:
-        bar = bars.iloc[-1]
-        ts = bars.index[-1].to_pydatetime()
-        market = sessions.market_from_tz(bars.index.tz)
-        tf = int(bars.attrs.get("timeframe") or self.cfg.timeframe_minutes)
+        """Process the bar that just closed (the last row of `bars`)."""
+        self.process_bar(
+            symbol,
+            bars.index[-1].to_pydatetime(),
+            int(bars.attrs.get("timeframe") or self.cfg.timeframe_minutes),
+            float(bars["open"].iat[-1]),
+            float(bars["high"].iat[-1]),
+            float(bars["low"].iat[-1]),
+            float(bars["close"].iat[-1]),
+            lambda: bars,
+        )
+
+    def process_bar(
+        self,
+        symbol: str,
+        ts: datetime,
+        tf: int,
+        bar_open: float,
+        bar_high: float,
+        bar_low: float,
+        price: float,
+        window: Callable[[], pd.DataFrame],
+    ) -> None:
+        """The per-bar steps. `window()` returns the history DataFrame ending at this bar; it
+        is only built when something needs it (backtests skip it on most bars)."""
+        market = sessions.market_for(symbol)
         bar_end = ts + timedelta(minutes=tf)
         day = sessions.session_date(market, ts)
         if day != self.risk.state.day:
             self._start_day(day, ts)
 
-        price = float(bar["close"])
+        if symbol in self.pending:
+            self._fill_pending(symbol, bar_open, ts, sessions.minutes_to_close(market, ts))
+
         self.broker.mark(symbol, price, ts)
         self.last_prices[symbol] = price
 
         trade = self.open.get(symbol)
         if trade is not None:
             decision = RiskManager.check_exit(
-                trade.side,
-                trade.stop,
-                trade.target,
-                float(bar["open"]),
-                float(bar["high"]),
-                float(bar["low"]),
+                trade.side, trade.stop, trade.target, bar_open, bar_high, bar_low
             )
             if decision is not None:
-                self._exit(symbol, decision.reason, decision.price, ts)
+                ref = decision.price
+                if decision.reason == "stop" and self.broker.name == "paper":
+                    ref = self.risk.cost_model.stop_reference(ref, trade.side == "long")
+                self._exit(symbol, decision.reason, ref, ts)
             elif (
                 self.decider is not None
                 and self.decider.role == "primary"
                 and not self.risk.state.halted
                 and self.decider.due(symbol, ts)
             ):
-                self._llm_manage_open(symbol, bars, ts, mtc=None)
+                self._llm_manage_open(symbol, window(), ts, mtc=None)
 
         if not self.risk.state.halted and self.risk.daily_loss_breached(self.equity()):
             self.journal.log("halt", self.risk.state.halt_reason, ts=ts)
             self._say(
                 f"DAILY LOSS STOP: {self.risk.state.halt_reason}. Flattening, done for today."
             )
+            self.pending.clear()
             self._flatten("daily_loss", ts)
 
         mtc = sessions.minutes_to_close(market, bar_end)
@@ -189,12 +222,25 @@ class Engine:
                 self._flatten("eod", ts, symbols=same_market)
             self.risk.block_entries(symbol)
 
-        if symbol not in self.open and not self.risk.state.halted:
-            self._maybe_enter(symbol, bars, ts, mtc)
+        if (
+            symbol not in self.open
+            and symbol not in self.pending
+            and not self.risk.state.halted
+            and (self.decider is not None or self._due(symbol, ts, tf))
+        ):
+            self._maybe_enter(symbol, window(), ts, mtc)
 
         self.equity_curve.append((ts, self.equity()))
         if self.mode != "backtest":
             self.snapshot(ts)
+
+    def _due(self, symbol: str, ts: datetime, tf: int) -> bool:
+        if self._due_fn is None:
+            return True
+        try:
+            return bool(self._due_fn(symbol, ts, tf, self.params))
+        except Exception:  # a broken pre-check must never hide a signal
+            return True
 
     def snapshot(self, ts: datetime | None = None) -> dict[str, Any]:
         """Write the engine's current state to the journal (the dashboard reads it)."""
@@ -262,6 +308,7 @@ class Engine:
             self._exit(symbol, decision.reason, decision.price, ts)
 
     def end_of_data(self, ts: datetime | None = None) -> None:
+        self.pending.clear()  # a signal on the very last bar has no next bar to fill on
         if self.open:
             last = ts or max(t.entry_ts for t in self.open.values())
             self._flatten("end_of_data", last)
@@ -292,13 +339,41 @@ class Engine:
             return None
         return sig
 
-    def _try_enter(self, symbol: str, sig: Signal, ts: datetime, mtc: float) -> bool:
+    def _skip(self, symbol: str, why: str, sig: Signal, ts: datetime) -> None:
+        """Log a refused signal once per symbol, reason and day (a strategy that keeps firing
+        while blocked would otherwise write a skip on every bar)."""
+        key = (symbol, why)
+        if key in self._skip_seen:
+            return
+        self._skip_seen.add(key)
+        self.skipped += 1
+        self.journal.log("skip", why, symbol=symbol, data={"signal": asdict(sig)}, ts=ts)
+
+    def _try_enter(
+        self,
+        symbol: str,
+        sig: Signal,
+        ts: datetime,
+        mtc: float,
+        defer: bool = True,
+        signal_price: float | None = None,
+    ) -> bool:
         sig = self._cap_stop(symbol, sig, ts)
-        ok, why = self.risk.can_enter(symbol, sig.side, len(self.open), mtc)
+        n_open = len(self.open) + len(self.pending)
+        ok, why = self.risk.can_enter(symbol, sig.side, n_open, mtc)
         if not ok:
-            self.skipped += 1
-            self.journal.log("skip", why, symbol=symbol, data={"signal": asdict(sig)}, ts=ts)
+            self._skip(symbol, why, sig, ts)
             return False
+        if defer and self.fill_next_open:
+            self.pending[symbol] = (sig, ts)
+            self.journal.log(
+                "signal",
+                f"{sig.reason} (fills at the next bar's open)",
+                symbol=symbol,
+                data=asdict(sig),
+                ts=ts,
+            )
+            return True
         qty, why = self.risk.position_size(
             self.equity(),
             self.broker.get_cash(),
@@ -309,13 +384,33 @@ class Engine:
             open_exposure=self.open_exposure(),
         )
         if qty <= 0:
-            self.skipped += 1
-            self.journal.log("skip", why, symbol=symbol, data={"signal": asdict(sig)}, ts=ts)
+            self._skip(symbol, why, sig, ts)
             return False
         if "capped" in why:
             self.capped_entries += 1
-        self._enter(symbol, sig, qty, ts)
+        self._enter(symbol, sig, qty, ts, signal_price=signal_price)
         return symbol in self.open
+
+    def _fill_pending(self, symbol: str, bar_open: float, ts: datetime, mtc: float) -> None:
+        """A backtest signal from the previous bar fills at this bar's open, if it still can:
+        the strategy's stop and target levels stay where they were."""
+        sig, _sig_ts = self.pending.pop(symbol)
+        if self.risk.state.halted:
+            self._skip(symbol, f"halted before the fill: {self.risk.state.halt_reason}", sig, ts)
+            return
+        long = sig.side == "long"
+        if (long and bar_open <= sig.stop) or (not long and bar_open >= sig.stop):
+            self._skip(symbol, "price gapped through the stop before the fill", sig, ts)
+            return
+        if sig.target is not None and (
+            (long and bar_open >= sig.target) or (not long and bar_open <= sig.target)
+        ):
+            self._skip(symbol, "price gapped past the target before the fill", sig, ts)
+            return
+        self.broker.mark(symbol, bar_open, ts)
+        self.last_prices[symbol] = bar_open
+        fill_sig = Signal(sig.side, bar_open, sig.stop, sig.target, reason=sig.reason)
+        self._try_enter(symbol, fill_sig, ts, mtc, defer=False, signal_price=sig.entry)
 
     def _cap_stop(self, symbol: str, sig: Signal, ts: datetime) -> Signal:
         """Rule 4: no stop may sit further than risk.max_stop_pct from the entry, whatever the
@@ -429,9 +524,17 @@ class Engine:
         if closing:
             self._exit(symbol, "llm_close", self.last_prices.get(symbol, trade.entry_price), ts)
 
-    def _enter(self, symbol: str, sig: Signal, qty: float, ts: datetime) -> None:
+    def _enter(
+        self,
+        symbol: str,
+        sig: Signal,
+        qty: float,
+        ts: datetime,
+        signal_price: float | None = None,
+    ) -> None:
         side = "buy" if sig.side == "long" else "sell"
-        self.journal.log("signal", sig.reason, symbol=symbol, data=asdict(sig), ts=ts)
+        if signal_price is None:
+            self.journal.log("signal", sig.reason, symbol=symbol, data=asdict(sig), ts=ts)
         orders = self.cfg.orders
         try:
             if orders.entry_type == "limit" and getattr(self.broker, "supports_limit", False):
@@ -495,7 +598,9 @@ class Engine:
             implicit_cost=order.implicit_cost,
             risk_per_unit=sig.risk_per_unit,
             reason=sig.reason,
+            signal_price=float(signal_price if signal_price is not None else sig.entry),
         )
+        self.open[symbol].backup_order_id = self._place_backup_stop(symbol, self.open[symbol], ts)
         self.risk.record_entry(symbol)
         self.journal.log(
             "entry",
@@ -509,29 +614,94 @@ class Engine:
             self._say(f"ENTRY {sig.side} {qty} {symbol} @ {price:.2f} (stop {sig.stop:.2f})")
 
     # ----------------------------------------------------------------------- exits
+    def _place_backup_stop(self, symbol: str, trade: OpenTrade, ts: datetime) -> str:
+        """A resting stop_limit at the broker, a little beyond the software stop: protection
+        that survives a crashed or frozen bot. Cancelled before every normal exit."""
+        orders = self.cfg.orders
+        if (
+            not orders.backup_stop
+            or trade.side != "long"
+            or not getattr(self.broker, "supports_stop_limit", False)
+        ):
+            return ""
+        buf = orders.backup_stop_buffer_pct / 100.0
+        stop_px = trade.stop * (1 - buf)
+        limit_px = stop_px * (1 - buf)
+        try:
+            order = self.broker.place_order(
+                symbol,
+                "sell",
+                trade.qty,
+                order_type="stop_limit",
+                limit_price=limit_px,
+                stop_price=stop_px,
+            )
+        except BrokerError as e:
+            self.journal.log("backup_stop_failed", str(e), symbol=symbol, ts=ts)
+            return ""
+        if order.status == "rejected" or not order.id:
+            self.journal.log("backup_stop_failed", order.note, symbol=symbol, ts=ts)
+            return ""
+        self.journal.log(
+            "backup_stop",
+            f"resting stop_limit {stop_px:.4f}/{limit_px:.4f} for {trade.qty}",
+            symbol=symbol,
+            data={"order_id": order.id},
+            ts=ts,
+        )
+        return order.id
+
+    def _cancel_backup(self, symbol: str, trade: OpenTrade) -> Order | None:
+        """Cancel the resting backup stop. Returns it if it had already (partly) filled."""
+        oid, trade.backup_order_id = trade.backup_order_id, ""
+        if not oid:
+            return None
+        try:
+            self.broker.cancel(oid)
+        except BrokerError:
+            pass  # already filled or already gone: the lookup below tells which
+        try:
+            order = self.broker.await_fill(self.broker.get_order(oid, symbol), timeout=5)
+        except (BrokerError, AttributeError):
+            return None
+        return order if order.filled_qty > 0 else None
+
     def _exit(self, symbol: str, reason: str, ref_price: float, ts: datetime) -> None:
         trade = self.open.get(symbol)
         if trade is None:
             return
         side = "sell" if trade.side == "long" else "buy"
-        self.broker.set_exec_price(symbol, ref_price)
-        try:
-            order = self.broker.place_order(symbol, side, trade.qty)
-            order = self.broker.await_fill(order)
-        except BrokerError as e:
-            self.errors += 1
-            self.journal.log("order_rejected", f"exit failed: {e}", symbol=symbol, ts=ts)
-            if self.mode == "live":
-                raise EngineError(f"exit order failed in live mode: {e}") from e
-            return
-        if order.status == "rejected" or order.filled_qty <= 0:
-            self.errors += 1
-            self.journal.log(
-                "order_rejected", f"exit {order.note or order.status}", symbol=symbol, ts=ts
-            )
-            if self.mode == "live":
-                raise EngineError(f"exit order rejected in live mode: {order.note}")
-            return
+        backup = self._cancel_backup(symbol, trade)
+        if backup is not None and backup.filled_qty >= trade.qty * 0.999:
+            order, reason = backup, "backup_stop"
+        else:
+            self.broker.set_exec_price(symbol, ref_price)
+            remaining = trade.qty - (backup.filled_qty if backup is not None else 0.0)
+            try:
+                order = self.broker.place_order(symbol, side, remaining)
+                order = self.broker.await_fill(order)
+            except BrokerError as e:
+                self.errors += 1
+                self.journal.log("order_rejected", f"exit failed: {e}", symbol=symbol, ts=ts)
+                if self.mode == "live":
+                    raise EngineError(f"exit order failed in live mode: {e}") from e
+                return
+            if order.status == "rejected" or order.filled_qty <= 0:
+                self.errors += 1
+                self.journal.log(
+                    "order_rejected", f"exit {order.note or order.status}", symbol=symbol, ts=ts
+                )
+                if self.mode == "live":
+                    raise EngineError(f"exit order rejected in live mode: {order.note}")
+                return
+            if backup is not None:  # part went at the backup stop, the rest at the market
+                total = backup.filled_qty + order.filled_qty
+                avg = (
+                    backup.filled_qty * float(backup.avg_fill_price or ref_price)
+                    + order.filled_qty * float(order.avg_fill_price or ref_price)
+                ) / total
+                order.avg_fill_price, order.filled_qty = avg, total
+                order.fees += backup.fees
         exit_price = float(order.avg_fill_price or ref_price)
         if self.broker.name != "paper" and not order.fees:
             order.fees = self.risk.cost_model.fees(trade.qty * exit_price)
