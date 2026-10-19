@@ -309,6 +309,21 @@ class Runner:
         self.run_shadows(now)
         self.apply_champion()
         self.export_store()
+        self.daily_report(day)
+
+    def daily_report(self, day) -> None:
+        """The day's report: file, Telegram, email. Never allowed to break the loop."""
+        if self.mode == "backtest":
+            return
+        try:
+            from cryptobot.daily_report import build_report, write_and_send
+
+            rep = build_report(
+                self.cfg, self.engine.journal, day, self.registry, self.research, self.regimes
+            )
+            write_and_send(self.cfg, rep, self.notifier)
+        except Exception as e:  # pragma: no cover - reporting must never stop trading
+            log.warning("daily report failed: %s", e)
 
     def run_digest(self, day, now: datetime) -> dict | None:
         """The day's research digest (at most one LLM call). Never allowed to break the loop."""

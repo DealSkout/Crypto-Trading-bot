@@ -1,6 +1,6 @@
 """Command line: backtest | paper | live | report | coach | refit | check | review | account |
 dashboard | guardian | resume | mcp | export | replay | research |
-regimes | learn | models | rollback | approve-live | revoke-live."""
+regimes | learn | models | rollback | approve-live | revoke-live | baseline | daily-report."""
 
 from __future__ import annotations
 
@@ -671,6 +671,12 @@ def build_parser() -> argparse.ArgumentParser:
     rs2.add_argument("--no-ai", action="store_true", help="digest from the numbers only")
     rg = sub.add_parser("regimes", help="today's regime per market and results per regime")
     add_data(rg)
+    bl = sub.add_parser("baseline", help="baseline metrics: backtests + paper results, saved")
+    add_data(bl)
+    dr = sub.add_parser("daily-report", help="build (and send) the daily report for a UTC day")
+    dr.add_argument("--date", default=None, help="YYYY-MM-DD (default: yesterday, UTC)")
+    dr.add_argument("--mode", choices=["paper", "live"], default=None)
+    dr.add_argument("--no-send", action="store_true", help="write the file only")
     le = sub.add_parser("learn", help="weekly self-learning run: challengers, gate, shadow start")
     le.add_argument("--dry-run", action="store_true", help="report only; registry unchanged")
     le.add_argument("--workers", type=int, default=None)
@@ -753,6 +759,79 @@ def cmd_regimes(cfg: Config, args: argparse.Namespace) -> int:
     if result is not None and result.regime_table:
         print(f"\nlatest {result.strategy} backtest, out of sample, by regime:")
         print(pd.DataFrame(result.regime_table).to_string(index=False))
+    return 0
+
+
+def cmd_baseline(cfg: Config, args: argparse.Namespace) -> int:
+    """Step 0 baseline on real data: every strategy's out-of-sample backtest after fees, and
+    the paper journal so far. Saved to reports/baseline.json for the daily report."""
+    from cryptobot.daily_report import METRIC_ROWS, _fmt, journal_metrics
+
+    bars = load_bars(cfg, args.data, args.days)
+    names = sorted({cfg.strategy, *cfg.learning.strategies})
+    out: dict = {
+        "created": datetime.now(UTC).isoformat(),
+        "data": args.data or cfg.data.provider,
+        "days": int(len({d for b in bars.values() for d in b.index.date})),
+        "symbols": cfg.symbols,
+        "backtests": {},
+    }
+    for name in names:
+        params = cfg.params if name == cfg.strategy else {}
+        r = run_backtest(cfg, bars, strategy=name, params=params)
+        out["backtests"][name] = {**r.metrics, "buy_and_hold": r.benchmarks["buy_and_hold"]}
+        r.save(cfg.reports_dir)
+    journal = Journal(cfg.journal_path, mode=cfg.mode)
+    first = journal.daily()
+    if len(first):
+        since = date_from(first["date"].iloc[0])
+        out["paper"] = journal_metrics(journal, cfg.mode, since, datetime.now(UTC).date())
+    path = Path(cfg.reports_dir) / "baseline.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out, indent=2, default=str))
+    cols = list(out["backtests"]) + (["paper so far"] if "paper" in out else [])
+    data = list(out["backtests"].values()) + ([out["paper"]] if "paper" in out else [])
+    print(f"Baseline over {out['days']} days of {out['data']} data, out of sample, after costs")
+    print(f"{'':<24}" + "".join(f"{c:>18}" for c in cols))
+    for label, key, fmt in METRIC_ROWS:
+        print(f"{label:<24}" + "".join(f"{_fmt(fmt, d.get(key)):>18}" for d in data))
+    print(f"saved {path}")
+    return 0
+
+
+def date_from(text: str):
+    from datetime import date as date_cls
+
+    return date_cls.fromisoformat(str(text)[:10])
+
+
+def cmd_daily_report(cfg: Config, args: argparse.Namespace) -> int:
+    from datetime import timedelta
+
+    from cryptobot.daily_report import build_report, write_and_send
+    from cryptobot.notify import make_notifier
+    from cryptobot.regime import RegimeDetector
+    from cryptobot.registry import Registry
+
+    day = date_from(args.date) if args.date else datetime.now(UTC).date() - timedelta(days=1)
+    mode = args.mode or cfg.mode
+    journal = Journal(cfg.journal_path, mode=mode)
+    research = None
+    if cfg.research.enabled:
+        from cryptobot.research.feed import ResearchFeed
+        from cryptobot.research.store import ResearchStore
+
+        research = ResearchFeed(cfg, ResearchStore(cfg.journal_path))
+    regimes = None
+    try:
+        regimes = RegimeDetector.from_bars(cfg.regime, load_bars(cfg, None, 40))
+    except DataError as e:
+        print(f"regimes unavailable: {e}")
+    rep = build_report(cfg, journal, day, Registry(cfg.journal_path), research, regimes)
+    path = write_and_send(
+        cfg, rep, None if args.no_send else make_notifier(cfg), email=not args.no_send
+    )
+    print(path.read_text())
     return 0
 
 
@@ -883,6 +962,8 @@ COMMANDS = {
     "research": cmd_research,
     "regimes": cmd_regimes,
     "learn": cmd_learn,
+    "baseline": cmd_baseline,
+    "daily-report": cmd_daily_report,
     "models": cmd_models,
     "rollback": cmd_rollback,
     "approve-live": cmd_approve_live,

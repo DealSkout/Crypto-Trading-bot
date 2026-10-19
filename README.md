@@ -47,6 +47,22 @@ It is the crypto sibling of the stock bot in
 - **Live trading stays locked** until `mode: live` **and** `CRYPTOBOT_LIVE_CONFIRM=yes` **and**
   the strategy beat buy-and-hold out of sample after costs **and** has 20+ paper days within
   the expected range.
+- **A self-learning loop that only adopts what is proven** (weekly, `learn`): challengers are
+  validated with walk-forward and purged cross-validation, then must beat the champion on a
+  holdout by a deflated-Sharpe margin, with 50+ trades, no worse drawdown and profits in 2+
+  regimes; winners shadow the champion for 2 weeks before they trade on paper. Live trading
+  only ever changes when you run `approve-live`. Details: [docs/SELF_LEARNING.md](docs/SELF_LEARNING.md).
+- **A feature store**: every decision, taken or skipped, is journalled with the features known
+  at that moment, exported to Parquet daily, and can be replayed exactly (`replay`).
+- **A market research feed**: funding rates and open interest (OKX, Bybit, Binance), the Fear &
+  Greed index, headlines scored locally with VADER, and a macro calendar (FOMC, CPI, token
+  unlocks); at most one Haiku call a day writes a research digest. It never trades.
+- **Market regimes** (trending, ranging, high-volatility, risk-off) on every trade, with results
+  tracked per regime.
+- **Sizing and pauses that only reduce risk**: volatility targeting and quarter Kelly, both
+  capped by the per-trade risk limit; no new entries in macro windows or on stale data.
+- **A daily report** (file, Telegram, email): P&L, metrics against the baseline, regimes, the
+  digest, champion against challengers and every risk event.
 
 ## Setup
 
@@ -90,6 +106,14 @@ labelled; it says nothing about markets).
 | `refit`, `coach` | Re-tune parameters through the backtest gate; research coach |
 | `check` | Whether the live-trading gate is met |
 | `mcp` | Tools for an AI risk agent (Claude Desktop, Claude Code) |
+| `baseline` | Baseline metrics on real data (every strategy, after fees) saved for the daily report |
+| `learn` | The weekly learning run (`--dry-run` changes nothing) |
+| `models` / `rollback <ver>` | The model registry / make an earlier version the paper champion |
+| `approve-live <ver> --i-approve` / `revoke-live` | Human-only: choose the version live trading uses |
+| `research` | Research feed status; `--refresh`, `--backfill` (history for backtests), `--digest` |
+| `regimes` | Today's regime per market and results per regime |
+| `daily-report` | Build and send a day's report (`--date`, `--no-send`) |
+| `export` / `replay --date` | Parquet copy of the feature store / re-run a day's decisions exactly |
 
 ## config.yaml
 
@@ -134,9 +158,24 @@ systemctl daemon-reload && systemctl enable --now cryptobot-paper cryptobot-dash
 The crypto dashboard also uses port 8787. If the stock bot's dashboard runs on the same server,
 change one of them with `--port` in its service file.
 
+Then, once: pull the research history (so backtests can use it), compute the baseline on real
+data, and switch on the weekly learning run:
+
+```bash
+sudo -u cryptobot .venv/bin/python -m cryptobot research --backfill
+sudo -u cryptobot .venv/bin/python -m cryptobot baseline
+cp deploy/cryptobot-learn.service deploy/cryptobot-learn.timer /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now cryptobot-learn.timer
+```
+
+To upgrade an existing install: `git pull`, `.venv/bin/pip install -e ".[claude]"` (adds
+`vaderSentiment`), `systemctl restart cryptobot-paper`, then the three steps above.
+
 ## Going live
 
-1. `python -m cryptobot check` must say the gate is met.
+1. `python -m cryptobot check` must say the gate is met. Choose the version live trades with
+   `python -m cryptobot approve-live <version> --i-approve` (it must have been the paper
+   champion); without one, live uses config.yaml's strategy and params.
 2. Put the **live** keys in `.env`, set `mode: live` in `config.yaml` and
    `CRYPTOBOT_LIVE_CONFIRM=yes` in `.env`.
 3. `python -m cryptobot live`. It starts at whatever size your limits allow; keep them small.
@@ -161,3 +200,5 @@ CI runs all of that on Python 3.11 to 3.13, plus a synthetic backtest.
 5. Secrets only in `.env` (git-ignored); a secret scan runs before every commit and in CI.
 6. No live trading until an out-of-sample backtest after costs beats buy-and-hold and 20+ paper
    days look as expected.
+7. The learning loop never auto-promotes to live and never touches `risk:`; an LLM never places
+   or sizes a trade.
