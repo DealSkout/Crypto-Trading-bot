@@ -1,0 +1,11 @@
+#   sudo cp deploy/cryptobot-coach.* /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now cryptobot-coach.timer
+[Unit]
+Description=Run the Cryptobot coach every weekday evening (after the US close)
+
+[Timer]
+OnCalendar=Mon..Fri 22:30 Europe/London
+Persistent=true
+
+[Install]
+WantedBy=timers.target

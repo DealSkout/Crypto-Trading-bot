@@ -1,0 +1,25 @@
+# secrets
+.env
+*.env
+!.env.example
+
+# runtime state
+cache/
+reports/
+*.sqlite
+*.sqlite-journal
+*.STOPPED
+cryptobot/strategies/proposed/
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+# coach output (reviews, proposals, journal) is per machine
+/coach/

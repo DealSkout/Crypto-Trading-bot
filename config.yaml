@@ -1,0 +1,103 @@
+# Cryptobot configuration. This is the ONLY file you need to edit.
+
+mode: paper              # paper | live   (live also needs CRYPTOBOT_LIVE_CONFIRM=yes in .env)
+broker: alpaca           # alpaca | paper   (paper = built-in simulator; with mode: paper, alpaca trades
+                         # your Alpaca PAPER account. Give this bot its own paper account.)
+symbols: [BTC/USD, ETH/USD]   # USD crypto pairs (USD, USDT or USDC quotes). Long-only.
+timeframe: 5m            # 1m | 5m | 15m
+strategy: orb            # orb | intraday_momentum | vwap_revert   (the "session" is the UTC day)
+params: {range_minutes: 30, target_r: 3}
+starting_cash: 1000      # backtest and built-in simulator starting cash, in USD
+allow_short: false       # must stay false: crypto on Alpaca is long-only, no margin
+max_entries_per_day: 1   # per pair, per UTC day
+
+risk:
+  risk_per_trade_pct: 0.5          # max loss per trade as % of equity (entry to stop)
+  max_daily_loss_pct: 2            # hit this and the bot flattens everything and stops for the UTC day
+  max_positions: 3
+  flatten_minutes_before_close: 10 # flatten everything this long before 00:00 UTC (day trading)
+  max_stop_pct: 3.0                # no stop may sit further than this from the entry, whoever set it
+  max_total_exposure_pct: 100      # all open positions together, as % of equity (100 = no leverage)
+
+costs:
+  commission: 0                    # flat per order, USD (Alpaca crypto: 0)
+  fee_pct: 0.25                    # Alpaca crypto fee per side; 0.25% is the lowest-volume taker fee.
+                                   # Check your tier on Alpaca's fee page and lower it if yours is less.
+  spread_bps: 5                    # full bid-ask spread; half is paid on each side
+  slippage_bps: 5                  # per side
+
+# How orders are sent. Alpaca crypto accepts only market, limit and stop_limit orders, with
+# time in force gtc or ioc. Exits (stops, targets, end of day) are always market orders.
+orders:
+  time_in_force: gtc               # gtc | ioc
+  entry_type: market               # market | limit (a marketable limit limit_offset_bps through the price)
+  limit_offset_bps: 10
+  fill_timeout_seconds: 30         # an entry not filled by then is cancelled (no trade)
+
+data:
+  provider: alpaca                 # alpaca (alpaca-py crypto bars) | csv | synthetic
+  lookback_days: 60
+  cache_dir: cache
+  csv_dir: data
+
+learning:
+  refit_every_days: 5              # walk-forward re-fit of params on the training window
+  min_oos_trades: 30               # a challenger needs this many out-of-sample trades
+  min_sharpe_gain: 0.1             # ...and must beat the champion's Sharpe by this much, after costs
+  train_fraction: 0.7              # first 70% of days = train, last 30% = out-of-sample
+
+# The coach NEVER applies anything: it writes reviews and proposals for you to read.
+coach:
+  enabled: true                    # the one switch: false turns the whole coach off
+  # Daily trade review, automatically after each UTC day: Python computes the stats, then ONE
+  # Claude call reviews every trade (verdict, mistake, lesson). Needs ANTHROPIC_API_KEY in .env;
+  # without it the review runs on the stats alone. Output: coach/journal.md, coach/reviews/,
+  # coach/proposals/. Never proposes changes to risk limits or to paper/live mode.
+  review_model: claude-haiku-5-5   # about $0.001 per day
+  review_max_tokens: 3000          # hard cap on the reply
+  min_trades_for_params: 30        # no parameter proposals before this many closed trades
+  dir: coach
+  # Strategy research coach (`python -m cryptobot coach`): backtests its own ideas through the gate.
+  provider: none                   # claude | ollama | none
+  model: claude-opus-5-5           # Claude model id (used when provider: claude)
+  ollama_model: llama3.1:8b        # local model name (used when provider: ollama)
+  lookback_days: 20
+  max_daily_cost_usd: 0.50         # shared daily cap for both coaches
+
+# Claude (or a local model) making buy/sell decisions INSIDE the trading loop. Off by default.
+# This suspends hard rule 2. Sizing, stops, the daily loss stop and the end-of-day flatten
+# stay in code whatever the model says. Costs money per decision; see README "Claude in the loop".
+decider:
+  provider: none                   # none | claude | ollama
+  role: last_resort                # last_resort (rules first, model when they have nothing) | final_say (model approves/rejects every rule signal) | primary (model decides every every_minutes)
+  model: claude-opus-5-5
+  ollama_model: llama3.1:8b
+  every_minutes: 30                # how often the model is consulted per symbol (last_resort/primary)
+  max_stop_pct: 2.0                # the model's stop may be at most this far from the price
+  min_confidence: 0.6              # answers below this are treated as hold
+  max_daily_cost_usd: 2.00         # once reached the model is not asked again that day (hold)
+  effort: medium                   # low | medium | high (Claude only; lower = faster, cheaper)
+  timeout_seconds: 30
+
+# The guardian: a watchdog that can STOP THE BOT COMPLETELY (flatten, write cryptobot.STOPPED,
+# alert, exit; `python -m cryptobot resume` is the only way back). The rules are always on.
+# The AI reviewer reads the results after each UTC day and may add a stop; it can never resume.
+guardian:
+  max_drawdown_pct: 10             # equity this far below its peak: stop
+  max_loss_30d_pct: 6              # net loss over the last 30 days: stop
+  max_consecutive_losing_days: 5
+  max_halts_30d: 3                 # daily-loss stops in 30 days: stop
+  max_errors_per_day: 10           # errors or rejected orders in a day: stop
+  min_trades_for_judgement: 10
+  expected_range_r: 1.0            # average R this far below the backtest's: stop
+  provider: claude                 # AI reviewer: claude | ollama | none (needs ANTHROPIC_API_KEY; the rules apply without it)
+  model: claude-opus-5-5
+  ollama_model: llama3.1:8b
+  min_confidence: 0.7              # the AI's stop needs at least this confidence
+  max_daily_cost_usd: 0.50
+  stop_file: cryptobot.STOPPED
+
+poll_seconds: 30                   # how often the 24/7 loop checks prices for software stops
+journal_path: cryptobot.sqlite
+reports_dir: reports
+telegram: true                     # send daily summaries if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID are set

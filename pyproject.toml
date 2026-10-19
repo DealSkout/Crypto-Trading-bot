@@ -1,0 +1,44 @@
+[project]
+name = "cryptobot"
+version = "0.1.0"
+description = "A small, readable, paper-first crypto day-trading bot for Alpaca: one config file, one command to backtest, one to paper trade, one to go live."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pandas>=2.2",
+  "numpy>=1.26",
+  "pyarrow>=15",
+  "pyyaml>=6",
+  "python-dotenv>=1.0",
+  "requests>=2.31",
+  "alpaca-py>=0.44",
+]
+
+[project.optional-dependencies]
+claude = ["anthropic>=1.0"]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+cryptobot = "cryptobot.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["cryptobot*"]
+
+[tool.setuptools.package-data]
+cryptobot = ["*.html"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

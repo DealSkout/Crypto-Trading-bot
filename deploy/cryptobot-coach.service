@@ -1,0 +1,10 @@
+# One-shot: the offline AI coach. Started by cryptobot-coach.timer after the US close.
+[Unit]
+Description=Cryptobot coach (offline review, never trades)
+
+[Service]
+Type=oneshot
+User=cryptobot
+WorkingDirectory=/opt/cryptobot
+EnvironmentFile=/opt/cryptobot/.env
+ExecStart=/opt/cryptobot/.venv/bin/python -m cryptobot coach
