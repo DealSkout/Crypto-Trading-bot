@@ -1,0 +1,18 @@
+# The local dashboard. It only reads the journal and reports; it never trades.
+# Bound to localhost: reach it from your laptop with
+#   ssh -L 8787:127.0.0.1:8787 user@your-vps   then open http://127.0.0.1:8787
+[Unit]
+Description=Cryptobot dashboard
+After=network-online.target
+
+[Service]
+Type=simple
+User=cryptobot
+WorkingDirectory=/opt/cryptobot
+EnvironmentFile=/opt/cryptobot/.env
+ExecStart=/opt/cryptobot/.venv/bin/python -m cryptobot dashboard --host 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

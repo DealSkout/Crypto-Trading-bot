@@ -1,0 +1,22 @@
+# systemd unit for the paper-trading loop. Adjust paths and the user.
+#   sudo cp deploy/cryptobot-paper.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now cryptobot-paper
+#   journalctl -u cryptobot-paper -f
+[Unit]
+Description=Cryptobot paper trading loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cryptobot
+WorkingDirectory=/opt/cryptobot
+EnvironmentFile=/opt/cryptobot/.env
+ExecStart=/opt/cryptobot/.venv/bin/python -m cryptobot paper
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

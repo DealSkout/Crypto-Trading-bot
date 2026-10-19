@@ -1,0 +1,26 @@
+# Lint + tests on every push and PR. This workflow never runs the bot or touches a broker.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -e ".[dev,claude]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: python scripts/secret_scan.py --all
+      - run: pytest -q
+      - name: backtest smoke test (synthetic data, no network)
+        run: python -m cryptobot backtest --data synthetic --days 30
