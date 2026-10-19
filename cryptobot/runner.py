@@ -40,11 +40,15 @@ class Runner:
         guardian=None,
         research=None,
         regimes=None,
+        registry=None,
+        shadows=None,
     ) -> None:
         self.cfg = cfg
         self.guardian = guardian
         self.research = research
         self.regimes = regimes
+        self.registry = registry
+        self.shadows = shadows
         self.mode = mode
         self.engine = engine
         self.fetch_bars = fetch_bars
@@ -204,8 +208,13 @@ class Runner:
                 if self.regimes is not None:  # breadth needs every market's completed days
                     self.regimes.update_from_bars(symbol, window)
                 self.engine.on_bar(symbol, window)
+                if self.shadows is not None:
+                    self.shadows.on_bar(symbol, window)
             else:
-                self.engine.on_tick(symbol, float(bars["close"].iloc[-1]), now)
+                price = float(bars["close"].iloc[-1])
+                self.engine.on_tick(symbol, price, now)
+                if self.shadows is not None:
+                    self.shadows.on_tick(symbol, price, now)
         self.check_day_rollover(now)
         try:
             self.journal.set_state(
@@ -241,6 +250,8 @@ class Runner:
                 self.guardian_stop((self.guardian.stop_info() or {}).get("reason", ""))
         self.run_trade_coach(day)
         self.run_digest(day, now)
+        self.run_shadows(now)
+        self.apply_champion()
         self.export_store()
 
     def run_digest(self, day, now: datetime) -> dict | None:
@@ -264,6 +275,37 @@ class Runner:
         except Exception as e:  # pragma: no cover - research must never stop trading
             log.warning("research digest failed: %s", e)
             return None
+
+    def run_shadows(self, now: datetime) -> None:
+        """Judge shadow runs that have run long enough (paper promotion only)."""
+        if self.shadows is None:
+            return
+        try:
+            for version, verdict, reason in self.shadows.evaluate(now):
+                if verdict != "wait":
+                    word = "PROMOTED to paper champion" if verdict == "promote" else "rejected"
+                    self.say(f"Shadow {version} {word}: {reason}")
+            self.shadows.sync()
+        except Exception as e:  # pragma: no cover - learning must never stop trading
+            log.warning("shadow evaluation failed: %s", e)
+
+    def apply_champion(self) -> None:
+        """Paper only: if the registry's champion changed (shadow promotion or a human
+        rollback), trade it from now on. Only between trades."""
+        if self.registry is None or self.mode != "paper" or self.engine.open:
+            return
+        try:
+            from cryptobot.strategies import load_strategy
+
+            champ = self.registry.champion()
+            if champ is None or champ.id == self.engine.version:
+                return
+            self.engine.set_model(
+                load_strategy(champ.strategy), champ.params, champ.filters, champ.id
+            )
+            self.say(f"Paper bot now trades {champ.describe()} ({champ.reason})")
+        except Exception as e:  # pragma: no cover
+            log.warning("champion switch failed: %s", e)
 
     def export_store(self) -> None:
         """Refresh the Parquet copy of the feature store. Never allowed to break the loop."""

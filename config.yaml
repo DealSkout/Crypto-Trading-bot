@@ -45,11 +45,21 @@ data:
   cache_dir: cache
   csv_dir: data
 
+# The weekly self-learning loop (`python -m cryptobot learn`, run by the systemd timer).
+# It may only start shadow runs and, after a clean 2-week shadow, change the PAPER champion.
+# It never touches live trading (approve-live is a human command) or anything under risk:.
 learning:
-  refit_every_days: 5              # walk-forward re-fit of params on the training window
-  min_oos_trades: 30               # a challenger needs this many out-of-sample trades
-  min_sharpe_gain: 0.1             # ...and must beat the champion's Sharpe by this much, after costs
-  train_fraction: 0.7              # first 70% of days = train, last 30% = out-of-sample
+  strategies: [orb, vwap_revert]   # intraday_momentum is left out: it cannot cover its costs
+  max_challengers: 20
+  holdout_fraction: 0.3            # last 30% of days = the out-of-sample holdout
+  min_oos_trades: 50               # holdout trades a challenger needs
+  min_sharpe_gain: 0.25            # holdout Sharpe must beat the champion's by this much...
+  dsr_min: 0.95                    # ...and the deflated Sharpe must say it is not luck
+  max_pbo: 0.5                     # probability of backtest overfitting allowed
+  min_profitable_regimes: 2
+  shadow_days: 14                  # a winner shadows the champion this long before promotion
+  workers: 0                       # parallel simulations (0 = CPU count - 1)
+  train_fraction: 0.7              # the plain backtest's train/test split
 
 # The coach NEVER applies anything: it writes reviews and proposals for you to read.
 coach:

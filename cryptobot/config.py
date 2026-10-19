@@ -82,10 +82,27 @@ class DataConfig:
 
 @dataclass
 class LearningConfig:
+    # legacy `refit` and the backtest's train/test split
     refit_every_days: int = 5
-    min_oos_trades: int = 30
-    min_sharpe_gain: float = 0.1
     train_fraction: float = 0.7
+    # the weekly learning loop (cryptobot/learning.py) and its promotion gate
+    strategies: list[str] = field(default_factory=lambda: ["orb", "vwap_revert"])
+    max_challengers: int = 20
+    holdout_fraction: float = 0.3  # last 30% of days: the out-of-sample holdout
+    min_oos_trades: int = 50  # holdout trades a challenger needs
+    min_sharpe_gain: float = 0.25  # holdout Sharpe must beat the champion's by this much
+    dsr_min: float = 0.95  # deflated Sharpe probability the gain is not luck
+    max_pbo: float = 0.5  # probability of backtest overfitting allowed
+    cv_blocks: int = 8  # combinatorially purged cross-validation blocks
+    wf_folds: int = 4  # walk-forward folds
+    embargo_days: int = 1  # days purged between train and test
+    min_profitable_regimes: int = 2
+    min_regime_trades: int = 5
+    trial_memory_days: int = 182  # learning runs in this window count as looks at the holdout
+    shadow_days: int = 14  # a winner runs this long in shadow before it can be champion
+    shadow_max_days: int = 28  # ...and is rejected if it still has too few trades by then
+    min_shadow_trades: int = 5
+    workers: int = 0  # parallel simulations; 0 = CPU count - 1
 
 
 @dataclass
@@ -366,8 +383,17 @@ def validate(cfg: Config) -> None:
     c = cfg.costs
     if min(c.commission, c.fee_pct, c.spread_bps, c.slippage_bps, c.stop_slippage_bps) < 0:
         raise ConfigError("costs must not be negative")
-    if not (0.3 <= cfg.learning.train_fraction <= 0.9):
+    lc = cfg.learning
+    if not (0.3 <= lc.train_fraction <= 0.9):
         raise ConfigError("learning.train_fraction must be between 0.3 and 0.9")
+    if not (0.1 <= lc.holdout_fraction <= 0.5):
+        raise ConfigError("learning.holdout_fraction must be between 0.1 and 0.5")
+    if not (0.5 <= lc.dsr_min < 1) or not (0 < lc.max_pbo <= 1):
+        raise ConfigError("learning: 0.5 <= dsr_min < 1 and 0 < max_pbo <= 1")
+    if lc.min_oos_trades < 1 or lc.min_profitable_regimes < 1 or lc.shadow_days < 1:
+        raise ConfigError("learning: min_oos_trades, min_profitable_regimes, shadow_days >= 1")
+    if lc.cv_blocks < 4 or lc.cv_blocks % 2 or lc.wf_folds < 2:
+        raise ConfigError("learning: cv_blocks must be even and >= 4; wf_folds >= 2")
     if cfg.starting_cash <= 0:
         raise ConfigError("starting_cash must be positive")
     if cfg.mode == "live" and cfg.broker == "paper":

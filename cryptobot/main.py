@@ -1,5 +1,6 @@
 """Command line: backtest | paper | live | report | coach | refit | check | review | account |
-dashboard | guardian | resume | mcp | export | replay | research | regimes."""
+dashboard | guardian | resume | mcp | export | replay | research |
+regimes | learn | models | rollback | approve-live | revoke-live."""
 
 from __future__ import annotations
 
@@ -207,8 +208,12 @@ def run_loop(cfg: Config, mode: str, args: argparse.Namespace) -> int:
     from cryptobot.runner import Runner
 
     setup_logging(args.verbose, logfile=f"cryptobot_{mode}.log")
-    module = load_strategy(cfg.strategy)
-    params = {**default_params(module), **cfg.params}
+    from cryptobot.registry import Registry
+
+    registry = Registry(cfg.journal_path)
+    model = trading_model(cfg, mode, registry)
+    module = load_strategy(model.strategy)
+    params = dict(model.params)
     journal = Journal(cfg.journal_path, mode=mode)
     notifier = make_notifier(cfg)
     broker = make_broker(cfg, mode)
@@ -224,6 +229,8 @@ def run_loop(cfg: Config, mode: str, args: argparse.Namespace) -> int:
     engine = Engine(
         cfg, module, params, broker, risk, journal, mode=mode, notifier=notifier, decider=decider
     )
+    engine.version = model.id
+    engine.filters = dict(model.filters)
     provider = args.data or cfg.data.provider
 
     from cryptobot.backtest import HISTORY_SESSIONS
@@ -263,6 +270,12 @@ def run_loop(cfg: Config, mode: str, args: argparse.Namespace) -> int:
             return row["value"] if row else None
 
         regimes.fear_greed = fear_greed
+    shadows = None
+    if mode == "paper":  # shadow runs never happen next to live money
+        from cryptobot.learning import ShadowRunner
+
+        shadows = ShadowRunner(cfg, registry, cfg.journal_path, engine.context_providers)
+        shadows.sync()
     runner = Runner(
         cfg,
         mode,
@@ -273,14 +286,34 @@ def run_loop(cfg: Config, mode: str, args: argparse.Namespace) -> int:
         guardian=guardian,
         research=research,
         regimes=regimes,
+        registry=registry,
+        shadows=shadows,
     )
     runner.install_signal_handlers()
     print(
-        f"{mode} mode: broker={broker.name} strategy={cfg.strategy} params={params}"
+        f"{mode} mode: broker={broker.name} model={model.id} strategy={model.strategy}"
+        f" params={params} filters={model.filters or 'none'}"
         f" symbols={cfg.symbols} data={provider}. Ctrl-C to stop (flattens first)."
     )
     runner.run_forever()
     return 0
+
+
+def trading_model(cfg: Config, mode: str, registry):
+    """Which model trades. Paper: the registry's champion (config.yaml is registered first, and
+    a human edit of it becomes the champion). Live: ONLY a version a human approved with
+    `approve-live`; without one, the human-set config.yaml strategy and params."""
+    from cryptobot.registry import Model
+
+    module = load_strategy(cfg.strategy)
+    config_params = {**default_params(module), **cfg.params}
+    if mode == "paper":
+        registry.sync_with_config(cfg.strategy, config_params)
+        return registry.champion()
+    approved = registry.live_version()
+    if approved is not None:
+        return approved
+    return Model(id="config", strategy=cfg.strategy, params=config_params)
 
 
 def cmd_paper(cfg: Config, args: argparse.Namespace) -> int:
@@ -330,7 +363,9 @@ def cmd_check(cfg: Config, args: argparse.Namespace) -> int:
 def cmd_refit(cfg: Config, args: argparse.Namespace) -> int:
     bars = load_bars(cfg, args.data, args.days)
     journal = Journal(cfg.journal_path, mode="paper")
-    out = learn.refit(cfg, bars, journal, apply=not args.no_apply)
+    # report only unless a human asks with --apply (the weekly `learn` loop is the automated
+    # path, and it goes through the full gate and a shadow run)
+    out = learn.refit(cfg, bars, journal, apply=args.apply)
     print(f"refit: changed={out['changed']} reason={out.get('reason')} params={out['params']}")
     if out.get("challenger"):
         c, ch = out["champion"], out["challenger"]
@@ -595,8 +630,8 @@ def build_parser() -> argparse.ArgumentParser:
     ch.add_argument("--dry-run", action="store_true", help="never apply anything")
     ch.add_argument("--provider", choices=["claude", "ollama"], default=None)
     add_data(ch)
-    rf = sub.add_parser("refit", help="walk-forward re-fit of params through the gate")
-    rf.add_argument("--no-apply", action="store_true")
+    rf = sub.add_parser("refit", help="legacy quick re-fit of params (reports only by default)")
+    rf.add_argument("--apply", action="store_true", help="write passing params to config.yaml")
     add_data(rf)
     sub.add_parser("check", help="show whether Rule 6 would allow going live")
     gd = sub.add_parser("guardian", help="run the watchdog review now; it may stop the bot")
@@ -636,6 +671,18 @@ def build_parser() -> argparse.ArgumentParser:
     rs2.add_argument("--no-ai", action="store_true", help="digest from the numbers only")
     rg = sub.add_parser("regimes", help="today's regime per market and results per regime")
     add_data(rg)
+    le = sub.add_parser("learn", help="weekly self-learning run: challengers, gate, shadow start")
+    le.add_argument("--dry-run", action="store_true", help="report only; registry unchanged")
+    le.add_argument("--workers", type=int, default=None)
+    add_data(le)
+    sub.add_parser("models", help="list the model registry (versions, status, reasons)")
+    rb = sub.add_parser("rollback", help="make an earlier version the paper champion again")
+    rb.add_argument("version")
+    rb.add_argument("--live", action="store_true", help="roll the LIVE version back instead")
+    al = sub.add_parser("approve-live", help="HUMAN ONLY: approve a version for live trading")
+    al.add_argument("version")
+    al.add_argument("--i-approve", action="store_true", help="required: you approve real money")
+    sub.add_parser("revoke-live", help="withdraw the live approval (live falls back to config)")
     ex = sub.add_parser("export", help="write the journal's decisions and trades to Parquet")
     ex.add_argument("--out", default="store", help="output folder (default: store)")
     ex.add_argument("--mode", choices=["paper", "live", "backtest"], default=None)
@@ -709,6 +756,85 @@ def cmd_regimes(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_learn(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.learning import run_learning
+    from cryptobot.registry import Registry
+
+    bars = load_bars(cfg, args.data, args.days)
+    registry = Registry(cfg.journal_path)
+    module = load_strategy(cfg.strategy)
+    registry.sync_with_config(cfg.strategy, {**default_params(module), **cfg.params})
+    research = cfg.journal_path if Path(cfg.journal_path).exists() else None
+    report = run_learning(
+        cfg, bars, registry, research_path=research, dry_run=args.dry_run, workers=args.workers
+    )
+    print(f"champion: {report['champion']}")
+    print(f"challengers tried: {len(report['challengers'])}; best: {report.get('best', 'none')}")
+    print(
+        f"verdict: {'ACCEPTED' if report['accepted'] else 'rejected'}; action: {report['action']}"
+    )
+    for r in report["reasons"]:
+        print(f"  - {r}")
+    print(f"report: {Path(cfg.reports_dir) / 'learning'}")
+    return 0
+
+
+def cmd_models(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.registry import Registry
+
+    reg = Registry(cfg.journal_path)
+    live = reg.live_version()
+    print(f"{'ver':<5} {'status':<10} {'live':<5} model / reason")
+    for m in reg.all():
+        flag = "LIVE" if live is not None and live.id == m.id else ""
+        print(f"{m.id:<5} {m.status:<10} {flag:<5} {m.describe().split(' ', 1)[1]}")
+        if m.reason:
+            print(f"{'':<22}{m.reason[:110]}")
+    return 0
+
+
+def cmd_rollback(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.registry import Registry, RegistryError
+
+    reg = Registry(cfg.journal_path)
+    try:
+        if args.live:
+            m = reg.approve_live(args.version, who="human (rollback)")
+            print(f"live now uses {m.describe()} (restart the live service to apply)")
+        else:
+            m = reg.rollback(args.version)
+            print(f"paper champion is now {m.describe()} (applied at the next UTC day or restart)")
+    except RegistryError as e:
+        print(f"rollback refused: {e}")
+        return 1
+    return 0
+
+
+def cmd_approve_live(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.registry import Registry, RegistryError
+
+    if not args.i_approve:
+        print("refusing: add --i-approve to confirm you approve this version for real money")
+        return 2
+    reg = Registry(cfg.journal_path)
+    try:
+        m = reg.approve_live(args.version, who=os.environ.get("USER", "human"))
+    except RegistryError as e:
+        print(f"refused: {e}")
+        return 1
+    print(f"approved for live: {m.describe()}")
+    print("Live trading still needs mode: live, CRYPTOBOT_LIVE_CONFIRM=yes and the Rule 6 gate.")
+    return 0
+
+
+def cmd_revoke_live(cfg: Config, args: argparse.Namespace) -> int:
+    from cryptobot.registry import Registry
+
+    Registry(cfg.journal_path).revoke_live(who=os.environ.get("USER", "human"))
+    print("live approval withdrawn: live mode falls back to config.yaml's strategy and params")
+    return 0
+
+
 def cmd_export(cfg: Config, args: argparse.Namespace) -> int:
     from cryptobot.store import export_store
 
@@ -756,6 +882,11 @@ COMMANDS = {
     "export": cmd_export,
     "research": cmd_research,
     "regimes": cmd_regimes,
+    "learn": cmd_learn,
+    "models": cmd_models,
+    "rollback": cmd_rollback,
+    "approve-live": cmd_approve_live,
+    "revoke-live": cmd_revoke_live,
     "replay": cmd_replay,
 }
 

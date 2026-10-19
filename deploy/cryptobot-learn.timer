@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the Cryptobot learning loop every Sunday
+
+[Timer]
+OnCalendar=Sun 02:17 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

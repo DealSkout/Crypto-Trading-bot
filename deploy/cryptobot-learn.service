@@ -1,0 +1,14 @@
+# One-shot: the weekly self-learning run. Started by cryptobot-learn.timer.
+# It can only start a shadow run (paper); it never touches live trading or risk limits.
+[Unit]
+Description=Cryptobot weekly learning loop (challengers, gate, shadow start; never trades live)
+
+[Service]
+Type=oneshot
+User=cryptobot
+WorkingDirectory=/opt/cryptobot
+EnvironmentFile=/opt/cryptobot/.env
+Nice=10
+ExecStart=/opt/cryptobot/.venv/bin/python -m cryptobot learn
+#   sudo cp deploy/cryptobot-learn.* /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now cryptobot-learn.timer

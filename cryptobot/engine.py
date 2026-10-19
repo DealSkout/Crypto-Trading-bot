@@ -129,6 +129,10 @@ class Engine:
         self.version = "config"  # the model version trading (the registry sets this)
         self.context_providers: list = []  # regime, research snapshot: see features.py
         self.record_decisions = True
+        # model filters from the registry: skip rules on decision features and per-regime size
+        # weights (capped at 1: a filter can only make a position smaller, never bigger)
+        self.filters: dict[str, Any] = {}
+        self._size_mult: dict[str, float] = {}
         self._source: dict[str, pd.DataFrame] = {}  # the bar window behind the current signal
         self._info: dict[str, tuple[int, dict[str, Any]]] = {}
 
@@ -433,6 +437,12 @@ class Engine:
         if not ok:
             self._skip(symbol, why, sig, ts)
             return False
+        if signal_price is None:  # at signal time (a pending fill was filtered already)
+            ok, why, mult = self._apply_filters(symbol)
+            if not ok:
+                self._skip(symbol, why, sig, ts)
+                return False
+            self._size_mult[symbol] = mult
         if defer and self.fill_next_open:
             self.pending[symbol] = (sig, ts)
             self.journal.log(
@@ -443,12 +453,13 @@ class Engine:
                 ts=ts,
             )
             return True
+        mult = min(1.0, max(0.0, self._size_mult.pop(symbol, 1.0)))
         qty, why = self.risk.position_size(
             self.equity(),
             self.broker.get_cash(),
             sig.entry,
             sig.stop,
-            lambda q: self.broker.round_qty_for(symbol, q),
+            lambda q: self.broker.round_qty_for(symbol, q * mult),
             symbol=symbol,
             open_exposure=self.open_exposure(),
         )
@@ -459,6 +470,47 @@ class Engine:
             self.capped_entries += 1
         self._enter(symbol, sig, qty, ts, signal_price=signal_price)
         return symbol in self.open
+
+    OPS = {
+        "<": lambda a, b: a < b,
+        "<=": lambda a, b: a <= b,
+        ">": lambda a, b: a > b,
+        ">=": lambda a, b: a >= b,
+        "==": lambda a, b: a == b,
+    }
+
+    def _apply_filters(self, symbol: str) -> tuple[bool, str, float]:
+        """(enter?, reason, size multiplier <= 1) from the model's filters and the features
+        at this decision. A rule whose feature is missing does not fire."""
+        if not self.filters:
+            return True, "ok", 1.0
+        feats = self._decision_info(symbol)["features"]
+        for rule in self.filters.get("skip_if", []):
+            value = feats.get(rule.get("feature"))
+            op = self.OPS.get(rule.get("op"))
+            if value is None or op is None:
+                continue
+            try:
+                if op(float(value), float(rule["value"])):
+                    return False, f"filter: {rule['feature']} {rule['op']} {rule['value']}", 0.0
+            except (TypeError, ValueError):
+                continue
+        regime = str(feats.get("regime", ""))
+        weight = float(self.filters.get("regime_weights", {}).get(regime, 1.0))
+        weight = min(1.0, max(0.0, weight))
+        if weight <= 0:
+            return False, f"filter: no entries in the {regime} regime", 0.0
+        return True, "ok", weight
+
+    def set_model(self, strategy, params: dict[str, Any], filters: dict, version: str) -> None:
+        """Switch to another model version (between trades: the caller checks it is flat)."""
+        self.strategy = strategy
+        self.strategy_name = strategy_name(strategy)
+        self._due_fn = due_check(strategy)
+        self.params = dict(params)
+        self.filters = dict(filters or {})
+        self.version = version
+        self.journal.log("model", f"now trading {version} {self.strategy_name} {self.params}")
 
     def _fill_pending(self, symbol: str, bar_open: float, ts: datetime, mtc: float) -> None:
         """A backtest signal from the previous bar fills at this bar's open, if it still can:
