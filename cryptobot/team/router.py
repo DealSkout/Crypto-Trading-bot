@@ -131,12 +131,15 @@ class Router:
                     continue
 
             self.last_tag = bot_id
+            self.broker.set_order_tag(bot_id)
             try:
                 order = self.broker.await_fill(self.broker.place_order(symbol, side, qty))
+                if not order.is_done and order.id:
+                    order = self._cancel_unfilled(order)
             except BrokerError as exc:
                 reports.append(self._rejection(intent, str(exc)))
                 continue
-            if not order.is_filled:
+            if order.filled_qty <= 0 and not order.is_filled:
                 note = order.note or f"broker returned status {order.status}"
                 reports.append(self._rejection(intent, note))
                 continue
@@ -164,6 +167,23 @@ class Router:
         return reports
 
     # helpers --------------------------------------------------------------------------
+    def _cancel_unfilled(self, order):
+        """An order still open after the fill wait is cancelled so it cannot fill later
+        behind the books' back. Whatever filled before the cancel landed is kept, so the
+        caller books a partial fill instead of pretending nothing happened."""
+        try:
+            self.broker.cancel(order.id)
+        except BrokerError:
+            pass  # the cancel can race a fill; the lookup below decides
+        current = self.broker.get_order(order.id, order.symbol)
+        if current is None:
+            current = order
+        if current.filled_qty > 0 and not current.is_filled:
+            current.note = current.note or "partial fill; the rest was cancelled"
+        elif current.filled_qty <= 0:
+            current.note = current.note or "not filled in time; cancelled"
+        return current
+
     def _precheck(
         self,
         intent: dict,

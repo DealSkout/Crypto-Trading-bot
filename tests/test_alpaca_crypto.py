@@ -110,6 +110,24 @@ def test_market_buy_rounds_to_the_increment_and_uses_gtc():
     assert o.is_filled and o.avg_fill_price == 100.5 and o.symbol == "BTC/USD"
 
 
+def test_client_order_id_carries_the_order_tag():
+    """The team router tags each residual with the bot id so the shared account shows who
+    traded; the tag is sanitised and the whole id stays inside Alpaca's 48 characters."""
+    c = FakeTradingClient()
+    b = broker(c)
+    b.set_order_tag("bot03")
+    b.place_order("BTC/USD", "buy", 0.5)
+    b.set_order_tag("bad tag/with:chars!" + "x" * 40)
+    b.place_order("BTC/USD", "buy", 0.5)
+    first, second = (r.client_order_id for r in c.submitted)
+    assert first.startswith("bot03-") and len(first) == len("bot03-") + 20
+    assert second.startswith("badtagwithcharsxxxxxxxxx-") and len(second) <= 48
+    assert first != second
+    b.set_order_tag("")
+    b.place_order("BTC/USD", "buy", 0.5)
+    assert c.submitted[-1].client_order_id.startswith("cryptobot-")
+
+
 def test_limit_and_stop_limit_with_ioc():
     c = FakeTradingClient()
     b = broker(c, time_in_force="ioc")

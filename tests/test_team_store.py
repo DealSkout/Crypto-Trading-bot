@@ -125,6 +125,54 @@ def test_consensus_round_trip(store):
     assert row == (T0.isoformat(), "BTC/USD", "buy", 3, "mom-1,rev-1,orb-1", 12.5)
 
 
+def test_consensus_entry_mark_and_scoring(store):
+    cid = store.log_consensus("ETH/USD", "sell", 3, ["a", "b", "c"], entry_mark=50.0, ts=T0)
+    pending = store.unscored_consensus()
+    assert len(pending) == 1
+    assert pending[0]["id"] == cid and pending[0]["entry_mark"] == 50.0
+    store.score_consensus(cid, -0.02)
+    assert store.unscored_consensus() == []
+
+
+def test_schema_migration_adds_entry_mark_to_an_old_store(tmp_path):
+    """A store created before entry_mark existed is upgraded in place on open."""
+    import sqlite3
+
+    path = tmp_path / "old.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE consensus (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,"
+        " symbol TEXT, side TEXT, n_bots INTEGER, bot_ids TEXT, outcome_pnl REAL)"
+    )
+    conn.execute(
+        "INSERT INTO consensus (ts, symbol, side, n_bots, bot_ids) VALUES (?,?,?,?,?)",
+        (T0.isoformat(), "BTC/USD", "buy", 3, "a,b,c"),
+    )
+    conn.commit()
+    conn.close()
+    upgraded = TeamStore(str(path))
+    try:
+        pending = upgraded.unscored_consensus()
+        assert len(pending) == 1 and pending[0]["entry_mark"] is None
+        upgraded.log_consensus("BTC/USD", "buy", 3, ["a", "b", "c"], entry_mark=1.0, ts=T1)
+        assert len(upgraded.unscored_consensus()) == 2
+    finally:
+        upgraded.close()
+
+
+def test_bot_and_team_state_round_trip(store):
+    assert store.bot_state("mom-1") is None
+    store.save_bot_state("mom-1", {"cash": 1234.5, "positions": {"BTC/USD": [1, 100]}}, ts=T0)
+    store.save_bot_state("mom-1", {"cash": 1200.0, "positions": {}}, ts=T1)
+    assert store.bot_state("mom-1") == {"cash": 1200.0, "positions": {}}
+    row = store.conn.execute("SELECT updated_ts FROM bot_state WHERE bot_id = 'mom-1'").fetchone()
+    assert row[0] == T1.isoformat()
+    assert store.team_state("internal_fees", 0.0) == 0.0
+    store.set_team_state("internal_fees", 3.25, ts=T0)
+    store.set_team_state("internal_fees", 4.5, ts=T1)
+    assert store.team_state("internal_fees") == 4.5
+
+
 def test_challengers_add_and_update(store):
     cid = store.add_challenger("mom-2", "wider stops variant", ts=T0)
     assert cid is not None

@@ -43,7 +43,16 @@ CREATE TABLE IF NOT EXISTS bot_versions (
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, kind TEXT NOT NULL, bot_id TEXT,
   message TEXT, data_json TEXT);
+CREATE TABLE IF NOT EXISTS bot_state (
+  bot_id TEXT PRIMARY KEY, state_json TEXT NOT NULL, updated_ts TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS team_state (
+  key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_ts TEXT NOT NULL);
 """
+
+# columns added after the first release; applied with ALTER TABLE when missing
+EXTRA_COLUMNS = {
+    "consensus": {"entry_mark": "REAL"},
+}
 
 
 def _iso(ts: datetime | None) -> str:
@@ -57,6 +66,11 @@ class TeamStore:
         self.conn = sqlite3.connect(path, timeout=10, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        for table, columns in EXTRA_COLUMNS.items():
+            have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            for name, kind in columns.items():
+                if name not in have:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
         self.conn.commit()
         self._lock = threading.Lock()
 
@@ -194,14 +208,32 @@ class TeamStore:
         n_bots: int,
         bot_ids: list[str] | str,
         outcome_pnl: float | None = None,
+        entry_mark: float | None = None,
         ts: datetime | None = None,
     ) -> int | None:
+        """`entry_mark` is the price when the bots agreed, so the outcome can be scored
+        later without re-reading bars."""
         if not isinstance(bot_ids, str):
             bot_ids = ",".join(bot_ids)
         return self._write(
-            "INSERT INTO consensus (ts, symbol, side, n_bots, bot_ids, outcome_pnl)"
-            " VALUES (?,?,?,?,?,?)",
-            (_iso(ts), symbol, side, n_bots, bot_ids, outcome_pnl),
+            "INSERT INTO consensus (ts, symbol, side, n_bots, bot_ids, outcome_pnl, entry_mark)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (_iso(ts), symbol, side, n_bots, bot_ids, outcome_pnl, entry_mark),
+        )
+
+    def unscored_consensus(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT id, ts, symbol, side, entry_mark FROM consensus WHERE outcome_pnl IS NULL"
+            " ORDER BY id"
+        ).fetchall()
+        return [
+            {"id": r[0], "ts": r[1], "symbol": r[2], "side": r[3], "entry_mark": r[4]}
+            for r in rows
+        ]
+
+    def score_consensus(self, consensus_id: int, outcome_pnl: float) -> None:
+        self._write(
+            "UPDATE consensus SET outcome_pnl = ? WHERE id = ?", (float(outcome_pnl), consensus_id)
         )
 
     # challengers -----------------------------------------------------------------------
@@ -271,6 +303,35 @@ class TeamStore:
             "INSERT INTO events (ts, kind, bot_id, message, data_json) VALUES (?,?,?,?,?)",
             (_iso(ts), kind, bot_id, message, json.dumps(data or {}, default=str)),
         )
+
+    # runtime state (survives a restart) -------------------------------------------------
+    def save_bot_state(self, bot_id: str, state: dict[str, Any], ts: datetime | None = None) -> None:
+        self._write(
+            "INSERT INTO bot_state (bot_id, state_json, updated_ts) VALUES (?,?,?)"
+            " ON CONFLICT(bot_id) DO UPDATE SET state_json = excluded.state_json,"
+            " updated_ts = excluded.updated_ts",
+            (bot_id, json.dumps(state, default=str), _iso(ts)),
+        )
+
+    def bot_state(self, bot_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT state_json FROM bot_state WHERE bot_id = ?", (bot_id,)
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def set_team_state(self, key: str, value: Any, ts: datetime | None = None) -> None:
+        self._write(
+            "INSERT INTO team_state (key, value_json, updated_ts) VALUES (?,?,?)"
+            " ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json,"
+            " updated_ts = excluded.updated_ts",
+            (key, json.dumps(value, default=str), _iso(ts)),
+        )
+
+    def team_state(self, key: str, default: Any = None) -> Any:
+        row = self.conn.execute(
+            "SELECT value_json FROM team_state WHERE key = ?", (key,)
+        ).fetchone()
+        return json.loads(row[0]) if row else default
 
     # read helpers ----------------------------------------------------------------------
     def events(self, limit: int = 1000) -> pd.DataFrame:

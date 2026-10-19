@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from cryptobot.brokers.base import Order
 from cryptobot.brokers.paper import PaperBroker
 from cryptobot.costs import CostModel
 from cryptobot.team.ledger import VirtualAccount
@@ -24,7 +25,39 @@ class TaggingBroker(PaperBroker):
     def place_order(self, symbol, side, qty, order_type="market", limit_price=None):
         if self.router is not None:
             self.tags.append(self.router.last_tag)
+            if self.router.last_tag is not None:  # router-driven: the adapter stamps the tag
+                assert self.order_tag == self.router.last_tag
         return super().place_order(symbol, side, qty, order_type, limit_price)
+
+
+class SlowBroker(PaperBroker):
+    """Fills only part of an order before the wait runs out; the rest rests open
+    until cancelled, the way a thin book at Alpaca behaves."""
+
+    def __init__(self, *args, fill_fraction=0.5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fill_fraction = fill_fraction
+        self.cancelled = []
+        self._open = {}
+
+    def place_order(self, symbol, side, qty, order_type="market", limit_price=None):
+        part = super().place_order(symbol, side, qty * self.fill_fraction, order_type, limit_price)
+        resting = Order(
+            id=part.id, symbol=symbol, side=side, qty=qty, status="partially_filled",
+            filled_qty=part.filled_qty, avg_fill_price=part.avg_fill_price, fees=part.fees,
+        )
+        self._open[resting.id] = resting
+        return resting
+
+    def await_fill(self, order, timeout=30.0):
+        return order  # still open when the wait ends
+
+    def get_order(self, order_id, symbol=""):
+        return self._open[order_id]
+
+    def cancel(self, order_id):
+        self.cancelled.append(order_id)
+        self._open[order_id].status = "cancelled"
 
 
 def make_team(
@@ -179,6 +212,34 @@ def test_broker_rejection_books_nothing(tmp_path):
     assert reports[0]["rejected"] is True and "cash" in reports[0]["reason"]
     assert broker.orders[0].status == "rejected"
     assert accounts["a"].cash == pytest.approx(100.0) and accounts["a"].positions == {}
+
+
+def test_unfilled_residual_is_cancelled_and_the_partial_is_booked(tmp_path):
+    """A residual that is still open after the fill wait must be cancelled (so it cannot
+    fill later behind the books) and whatever did fill must land in the bot's books."""
+    broker = SlowBroker(20_000.0, NO_COSTS, fill_fraction=0.25)
+    accounts = {"a": VirtualAccount("a", 10_000.0)}
+    limits = PortfolioLimits(kill_switch_file=str(tmp_path / "team.KILLSWITCH"))
+    router = Router(broker, accounts, limits, NO_COSTS, clock=lambda: T0)
+    router.mark("BTC/USD", 100.0, T0)
+    router.submit("a", "BTC/USD", "buy", 4, 100.0)
+    reports = router.flush(T0)
+    assert broker.cancelled == ["paper-1"]
+    assert len(reports) == 1 and reports[0].get("internal") is False
+    assert reports[0]["qty"] == pytest.approx(1.0)  # the quarter that filled, not the 4 asked
+    assert accounts["a"].positions["BTC/USD"][0] == pytest.approx(1.0)
+    assert accounts["a"].cash == pytest.approx(10_000 - 100.0)
+
+    # nothing filled at all: cancelled and reported as a rejection, books untouched
+    none = SlowBroker(20_000.0, NO_COSTS, fill_fraction=0.0)
+    accounts = {"a": VirtualAccount("a", 10_000.0)}
+    router = Router(none, accounts, limits, NO_COSTS, clock=lambda: T0)
+    router.mark("BTC/USD", 100.0, T0)
+    router.submit("a", "BTC/USD", "buy", 4, 100.0)
+    reports = router.flush(T0)
+    assert reports[0]["rejected"] is True and "cancelled" in reports[0]["reason"]
+    assert none.cancelled == ["paper-1"]
+    assert accounts["a"].positions == {} and accounts["a"].cash == pytest.approx(10_000)
 
 
 def test_team_books_track_real_account(tmp_path):

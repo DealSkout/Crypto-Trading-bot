@@ -226,7 +226,8 @@ class AlpacaCryptoBroker(Broker):
             "qty": qty,
             "side": OrderSide.BUY if side == "buy" else OrderSide.SELL,
             "time_in_force": TimeInForce(self.time_in_force),
-            "client_order_id": f"cryptobot-{uuid.uuid4().hex[:20]}",
+            # Alpaca allows 48 characters: a 24-character tag plus the dash and 20 hex fits
+            "client_order_id": f"{self.order_tag}-{uuid.uuid4().hex[:20]}",
         }
         if order_type == "market":
             req = MarketOrderRequest(**common)

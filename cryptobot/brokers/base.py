@@ -54,6 +54,9 @@ class Broker(ABC):
     supports_fractional = False
     qty_decimals = 0
     supports_native_brackets = False
+    # prefix for every client order id this adapter sends; the team router sets it to the
+    # bot id before each order so the real account shows who traded (see set_order_tag)
+    order_tag = "cryptobot"
 
     @abstractmethod
     def get_cash(self) -> float: ...
@@ -91,6 +94,16 @@ class Broker(ABC):
     def await_fill(self, order: Order, timeout: float = 30.0) -> Order:
         """Block until a market order is done. Simulators fill instantly."""
         return order
+
+    def get_order(self, order_id: str, symbol: str = "") -> Order | None:
+        """The current state of an order, or None when the adapter cannot look orders up."""
+        return None
+
+    def set_order_tag(self, tag: str) -> None:
+        """Who the next orders are for: letters, digits, dash and underscore only, so the tag is
+        safe inside any broker's client order id."""
+        clean = "".join(ch for ch in str(tag) if ch.isalnum() or ch in "-_")
+        self.order_tag = (clean or "cryptobot")[:24]
 
     def round_qty(self, qty: float) -> float:
         if qty <= 0:
