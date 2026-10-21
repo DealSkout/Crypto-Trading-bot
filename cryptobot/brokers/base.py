@@ -54,6 +54,10 @@ class Broker(ABC):
     supports_fractional = False
     qty_decimals = 0
     supports_native_brackets = False
+    # False when the venue takes its fee out of what you receive instead of reporting it on
+    # the order (Alpaca crypto: a buy delivers qty minus the fee in coins, a sell pays out
+    # proceeds minus the fee in dollars); bookkeepers then charge the cost model's fee
+    reports_fees = True
     # prefix for every client order id this adapter sends; the team router sets it to the
     # bot id before each order so the real account shows who traded (see set_order_tag)
     order_tag = "cryptobot"

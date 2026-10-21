@@ -63,6 +63,7 @@ class AlpacaCryptoBroker(Broker):
     supports_limit = True
     supports_protective_stop = True  # resting stop_limit survives a crashed process
     delayed_entry = False  # live market orders fill moments after the bar closes anyway
+    reports_fees = False  # the crypto fee comes out of the coins (buys) or dollars (sells)
 
     # the protective limit sits this far through the stop so a fast move still fills
     PROTECTIVE_LIMIT_GAP = 0.005

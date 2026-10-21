@@ -268,6 +268,55 @@ def test_unfilled_residual_is_cancelled_and_the_partial_is_booked(tmp_path):
     assert accounts["a"].positions == {} and accounts["a"].cash == pytest.approx(10_000)
 
 
+class FeeInKindBroker(PaperBroker):
+    """Behaves like Alpaca crypto: no fee on the order; a buy delivers qty minus the fee
+    in coins, a sell pays out proceeds minus the fee in dollars."""
+
+    reports_fees = False
+
+    def place_order(self, symbol, side, qty, order_type="market", limit_price=None):
+        if side == "sell":
+            qty = min(qty, self._qty.get(symbol, 0.0))  # never more than held, like Alpaca
+        order = super().place_order(symbol, side, qty, order_type, limit_price)
+        if order.is_filled:
+            fee = order.fees
+            self.cash += fee  # undo the simulator's cash fee ...
+            if side == "buy":  # ... and take it in coins instead
+                self._qty[symbol] -= fee / order.avg_fill_price
+            else:
+                self.cash -= fee
+            order.fees = 0.0
+        return order
+
+
+def test_fees_kept_by_the_venue_are_booked_and_exits_still_close(tmp_path):
+    cm = CostModel(commission=0.0, fee_pct=0.25, spread_bps=0.0, slippage_bps=0.0)
+    broker = FeeInKindBroker(10_000.0, cm)
+    accounts = {"a": VirtualAccount("a", 10_000.0)}
+    limits = PortfolioLimits(kill_switch_file=str(tmp_path / "team.KILLSWITCH"))
+    router = Router(broker, accounts, limits, cm, clock=lambda: T0)
+    router.mark("BTC/USD", 100.0, T0)
+    router.submit("a", "BTC/USD", "buy", 1.0, 100.0)
+    router.flush(T0)
+    held_real = broker.get_positions()[0].qty
+    assert held_real == pytest.approx(0.9975)
+    assert accounts["a"].positions["BTC/USD"][0] == pytest.approx(held_real)  # coins received
+    assert abs(broker.get_equity() - accounts["a"].equity({"BTC/USD": 100.0})) < 1e-6
+    # the bot's own simulator still thinks it holds 1.0 and exits with 1.0
+    router.mark("BTC/USD", 110.0, T0)
+    reports = router.flush(T0) or []
+    router.submit("a", "BTC/USD", "sell", 1.0, 110.0)
+    reports = router.flush(T0)
+    assert not any(r.get("rejected") for r in reports)
+    assert broker.get_positions() == [] and accounts["a"].positions == {}
+    assert abs(broker.get_equity() - accounts["a"].equity({"BTC/USD": 110.0})) < 1e-6
+    # a sell far beyond the books is still refused
+    router.submit("a", "BTC/USD", "buy", 1.0, 110.0)
+    router.flush(T0)
+    router.submit("a", "BTC/USD", "sell", 1.5, 110.0)
+    assert router.flush(T0)[0]["rejected"] is True
+
+
 def test_team_books_track_real_account(tmp_path):
     """The ledger invariant: after a mixed sequence of real fills, internal
     crosses and rejections, the sum of virtual equities plus the internal fees

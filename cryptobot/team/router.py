@@ -37,6 +37,8 @@ class RouterRejection(Exception):
 class Router:
     """Synchronous, deterministic order router for one shared account."""
 
+    FEE_SLACK = 0.02  # a sell up to 2% above the books is a fee rounding, not an error
+
     def __init__(
         self,
         broker: Broker,
@@ -148,7 +150,16 @@ class Router:
             fill_price = (
                 order.avg_fill_price if order.avg_fill_price is not None else intent["ref_price"]
             )
-            self.accounts[bot_id].apply_fill(symbol, side, fill_qty, fill_price, order.fees)
+            fees = order.fees
+            if not getattr(self.broker, "reports_fees", True) and not fees:
+                # the venue kept its fee: a buy delivered fewer coins, a sell paid out less.
+                # Book exactly that, so the virtual books match what the account holds.
+                fee_value = self.cost_model.fees(fill_qty * fill_price)
+                if side == "buy" and fill_price > 0:
+                    fill_qty -= fee_value / fill_price  # the coins actually received
+                fees = fee_value
+            self.accounts[bot_id].apply_fill(symbol, side, fill_qty, fill_price, fees)
+            order.fees = fees
             signed = fill_qty if side == "buy" else -fill_qty
             gross += signed * mark_prices.get(symbol, fill_price)
             team_qty[symbol] = team_qty.get(symbol, 0.0) + signed
@@ -205,8 +216,14 @@ class Router:
         key = (bot_id, symbol)
         if side == "sell":
             held = self.accounts[bot_id].positions.get(symbol, (0.0, 0.0))[0]
-            if qty > held + pending.get(key, 0.0) + 1e-9:
-                return "sell exceeds position"
+            available = held + pending.get(key, 0.0)
+            if qty > available + 1e-9:
+                # a bot's own simulator does not know the venue kept part of its buy as a fee,
+                # so its exit asks for slightly more than the books hold: sell what is held
+                if available > 0 and qty <= available * (1 + self.FEE_SLACK):
+                    intent["qty"] = qty = available
+                else:
+                    return "sell exceeds position"
             pending[key] = pending.get(key, 0.0) - qty
             return ""
         if killed:
