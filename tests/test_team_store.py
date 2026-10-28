@@ -200,3 +200,11 @@ def test_events_round_trip(store):
     assert len(df) == 2
     assert df.iloc[0]["kind"] == "resume"  # newest first
     assert df.iloc[1]["bot_id"] == "mom-1" and '"source": "router"' in df.iloc[1]["data_json"]
+
+
+def test_daily_metrics_carry_start_equity_and_transfers(store):
+    store.record_daily_metrics("2026-10-20", "b", equity=1010.0, pnl=-15.0, trades=2,
+                               start_equity=1000.0, transfers=25.0, realized_pnl=-12.0)
+    row = store.daily_metrics().iloc[0]
+    assert row["start_equity"] == 1000.0 and row["transfers"] == 25.0
+    assert row["realized_pnl"] == -12.0 and row["pnl"] == -15.0

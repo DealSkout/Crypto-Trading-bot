@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS team_state (
 # columns added after the first release; applied with ALTER TABLE when missing
 EXTRA_COLUMNS = {
     "consensus": {"entry_mark": "REAL"},
+    # daily returns come from equity snapshots: (end - start - transfers) / start, so capital
+    # the coordinator moves in or out is never counted as profit or loss
+    "bot_metrics_daily": {"start_equity": "REAL", "transfers": "REAL", "realized_pnl": "REAL"},
 }
 
 
@@ -150,11 +153,18 @@ class TeamStore:
         sharpe: float | None = None,
         drawdown_pct: float | None = None,
         regime: str = "",
+        start_equity: float | None = None,
+        transfers: float = 0.0,
+        realized_pnl: float | None = None,
     ) -> None:
+        """`equity` is the day's closing equity and `pnl` its equity change net of
+        `transfers`; `realized_pnl` is what closed trades booked that day."""
         self._write(
             "INSERT OR REPLACE INTO bot_metrics_daily (day, bot_id, equity, pnl, trades, sharpe,"
-            " drawdown_pct, regime) VALUES (?,?,?,?,?,?,?,?)",
-            (day, bot_id, equity, pnl, trades, sharpe, drawdown_pct, regime),
+            " drawdown_pct, regime, start_equity, transfers, realized_pnl)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (day, bot_id, equity, pnl, trades, sharpe, drawdown_pct, regime, start_equity,
+             transfers, realized_pnl),
         )
 
     # regimes ---------------------------------------------------------------------------
