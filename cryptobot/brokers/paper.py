@@ -86,8 +86,10 @@ class PaperBroker(Broker):
     ) -> Order:
         if side not in ("buy", "sell"):
             raise BrokerError(f"side must be buy or sell, got {side!r}")
-        if order_type != "market":
-            raise BrokerError("the paper broker only simulates market orders")
+        if order_type not in ("market", "limit"):
+            raise BrokerError("the paper broker simulates market and limit orders")
+        if order_type == "limit" and not limit_price:
+            raise BrokerError("a limit order needs limit_price")
         qty = self.round_qty(qty)
         self._n += 1
         order = Order(id=f"paper-{self._n}", symbol=symbol, side=side, qty=qty, created_at=self.now)
@@ -95,15 +97,22 @@ class PaperBroker(Broker):
             order.status, order.note = "rejected", "quantity rounds to zero"
             self.orders.append(order)
             return order
-        ref = self._exec.pop(symbol, None)
-        if ref is None:
-            ref = self._prices.get(symbol)
-        if ref is None:
-            raise BrokerError(f"no price known for {symbol}; call mark() first")
         is_buy = side == "buy"
-        price = self.cost_model.fill_price(ref, is_buy)
+        maker = order_type == "limit"
+        if maker:
+            # the caller (the engine) has checked the market traded through the limit: a
+            # resting limit fills at its own price as a maker, no spread or slippage
+            ref = price = float(limit_price)
+            self._exec.pop(symbol, None)
+        else:
+            ref = self._exec.pop(symbol, None)
+            if ref is None:
+                ref = self._prices.get(symbol)
+            if ref is None:
+                raise BrokerError(f"no price known for {symbol}; call mark() first")
+            price = self.cost_model.fill_price(ref, is_buy)
         notional = price * qty
-        fees = self.cost_model.fees(notional, fx=self._fx_for(symbol))
+        fees = self.cost_model.fees(notional, fx=self._fx_for(symbol), maker=maker)
         if is_buy and self.cash + 1e-9 < notional + fees:
             order.status, order.note = "rejected", "insufficient cash"
             self.orders.append(order)
@@ -134,9 +143,22 @@ class PaperBroker(Broker):
         self.total_fees += fees
         self.total_implicit += implicit
         order.status = "filled"
+        order.type = order_type
         order.filled_qty = qty
         order.avg_fill_price = price
         order.fees = fees
         order.implicit_cost = implicit
         self.orders.append(order)
         return order
+
+    def adjust(self, symbol: str, qty_delta: float, price: float) -> None:
+        """Book a correction without fees or P&L: the team router found the real account
+        filled less than this simulation did, so part of a simulated entry is undone at
+        its own entry price."""
+        new = self._qty.get(symbol, 0.0) + qty_delta
+        if abs(new) < 1e-12:
+            new = 0.0
+        self._qty[symbol] = new
+        if new == 0:
+            self._avg.pop(symbol, None)
+        self.cash -= qty_delta * price

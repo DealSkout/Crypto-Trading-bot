@@ -46,6 +46,8 @@ TRADE_EXTRA_COLUMNS = {
     "exit_slippage_bps": "REAL",
     "fees": "REAL",
     "features": "TEXT",
+    "planned_r": "REAL",  # R at the planned exit level (stop -1, target +x) before any costs
+    "actual_r": "REAL",  # net P&L in units of the PLANNED risk (signal price to stop)
 }
 
 DECISION_FIELDS = (
@@ -126,7 +128,8 @@ class Journal:
             "INSERT INTO trades (mode, strategy, symbol, side, qty, entry_ts, entry_price, exit_ts,"
             " exit_price, stop, target, pnl, r_multiple, costs, exit_reason, signal_reason,"
             " asset_class, version, regime, signal_price, entry_slippage_bps, exit_slippage_bps,"
-            " fees, features) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " fees, features, planned_r, actual_r)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 self.mode,
                 strategy,
@@ -152,6 +155,8 @@ class Journal:
                 t.get("exit_slippage_bps"),
                 t.get("fees"),
                 t.get("features"),
+                t.get("planned_r"),
+                t.get("actual_r"),
             ),
         )
         self.conn.commit()

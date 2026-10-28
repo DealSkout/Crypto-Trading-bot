@@ -43,6 +43,11 @@ CREATE TABLE IF NOT EXISTS bot_versions (
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, kind TEXT NOT NULL, bot_id TEXT,
   message TEXT, data_json TEXT);
+CREATE TABLE IF NOT EXISTS real_trades (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id TEXT, symbol TEXT, lot TEXT, entry_ts TEXT,
+  exit_ts TEXT, qty REAL, entry_price REAL, exit_price REAL, signal_price REAL, stop REAL,
+  target REAL, reason TEXT, gross_pnl REAL, fees REAL, slippage REAL, net_pnl REAL,
+  planned_r REAL, actual_r REAL);
 CREATE TABLE IF NOT EXISTS bot_state (
   bot_id TEXT PRIMARY KEY, state_json TEXT NOT NULL, updated_ts TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS team_state (
@@ -52,6 +57,9 @@ CREATE TABLE IF NOT EXISTS team_state (
 # columns added after the first release; applied with ALTER TABLE when missing
 EXTRA_COLUMNS = {
     "consensus": {"entry_mark": "REAL"},
+    # daily returns come from equity snapshots: (end - start - transfers) / start, so capital
+    # the coordinator moves in or out is never counted as profit or loss
+    "bot_metrics_daily": {"start_equity": "REAL", "transfers": "REAL", "realized_pnl": "REAL"},
 }
 
 
@@ -150,11 +158,18 @@ class TeamStore:
         sharpe: float | None = None,
         drawdown_pct: float | None = None,
         regime: str = "",
+        start_equity: float | None = None,
+        transfers: float = 0.0,
+        realized_pnl: float | None = None,
     ) -> None:
+        """`equity` is the day's closing equity and `pnl` its equity change net of
+        `transfers`; `realized_pnl` is what closed trades booked that day."""
         self._write(
             "INSERT OR REPLACE INTO bot_metrics_daily (day, bot_id, equity, pnl, trades, sharpe,"
-            " drawdown_pct, regime) VALUES (?,?,?,?,?,?,?,?)",
-            (day, bot_id, equity, pnl, trades, sharpe, drawdown_pct, regime),
+            " drawdown_pct, regime, start_equity, transfers, realized_pnl)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (day, bot_id, equity, pnl, trades, sharpe, drawdown_pct, regime, start_equity,
+             transfers, realized_pnl),
         )
 
     # regimes ---------------------------------------------------------------------------
@@ -303,6 +318,31 @@ class TeamStore:
             "INSERT INTO events (ts, kind, bot_id, message, data_json) VALUES (?,?,?,?,?)",
             (_iso(ts), kind, bot_id, message, json.dumps(data or {}, default=str)),
         )
+
+    # real trades (one per closed lot on the real account) ----------------------------------
+    def log_real_trade(self, r: dict[str, Any]) -> int | None:
+        """gross_pnl is the P&L at the PLANNED prices (signal price to the planned exit
+        level), fees and slippage are what execution cost, net_pnl is what the account got:
+        net = gross - fees - slippage."""
+        return self._write(
+            "INSERT INTO real_trades (bot_id, symbol, lot, entry_ts, exit_ts, qty, entry_price,"
+            " exit_price, signal_price, stop, target, reason, gross_pnl, fees, slippage, net_pnl,"
+            " planned_r, actual_r) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (r["bot_id"], r["symbol"], r.get("lot", ""),
+             _iso(r.get("entry_ts")) if r.get("entry_ts") else None,
+             _iso(r.get("exit_ts")) if r.get("exit_ts") else None,
+             r.get("qty"), r.get("entry_price"), r.get("exit_price"), r.get("signal_price"),
+             r.get("stop"), r.get("target"), r.get("reason", ""), r.get("gross_pnl"),
+             r.get("fees"), r.get("slippage"), r.get("net_pnl"), r.get("planned_r"),
+             r.get("actual_r")),
+        )
+
+    def real_trades(self, bot_id: str | None = None) -> pd.DataFrame:
+        q, args = "SELECT * FROM real_trades WHERE 1=1", []
+        if bot_id is not None:
+            q += " AND bot_id = ?"
+            args.append(bot_id)
+        return pd.read_sql_query(q + " ORDER BY id", self.conn, params=args)
 
     # runtime state (survives a restart) -------------------------------------------------
     def save_bot_state(self, bot_id: str, state: dict[str, Any], ts: datetime | None = None) -> None:

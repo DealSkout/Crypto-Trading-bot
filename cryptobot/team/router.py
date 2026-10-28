@@ -15,8 +15,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from cryptobot.brokers.base import Broker, BrokerError
+from cryptobot.config import OrderConfig
 from cryptobot.costs import CostModel
 from cryptobot.team.ledger import VirtualAccount
+from cryptobot.team.lots import LotDesk
 
 
 @dataclass
@@ -46,6 +48,7 @@ class Router:
         limits: PortfolioLimits,
         cost_model: CostModel,
         clock: Callable[[], datetime] | None = None,
+        order_settings: OrderConfig | None = None,
     ) -> None:
         self.broker = broker
         self.accounts = accounts
@@ -56,6 +59,8 @@ class Router:
         self._queue: list[dict] = []
         self.internal_fees = 0.0  # fees charged on internal crosses; stays in the real account
         self.last_tag: str | None = None  # bot tag set right before each broker order
+        self.order_settings = order_settings or OrderConfig()
+        self.desk = LotDesk(self)  # working orders per position (limit entries, broker stops)
 
     # marks ----------------------------------------------------------------------------
     def mark(self, symbol: str, price: float, ts: datetime) -> None:
@@ -176,6 +181,39 @@ class Router:
                 }
             )
         return reports
+
+    # lot desk support -----------------------------------------------------------------
+    def mark_price(self, symbol: str) -> float | None:
+        marked = self._marks.get(symbol)
+        return marked[0] if marked else None
+
+    def entry_precheck(
+        self, bot_id: str, symbol: str, qty: float, price: float, ts: datetime,
+        working: float = 0.0,
+    ) -> str:
+        """Why a new entry may not be placed, or "" if it may: kill switch, missing or stale
+        mark, and the portfolio caps counting entries already working at the broker."""
+        if os.path.exists(self.limits.kill_switch_file):
+            return "kill switch active"
+        marked = self._marks.get(symbol)
+        if marked is None:
+            return "no mark for symbol"
+        if (ts - marked[1]).total_seconds() > self.limits.stale_after_seconds:
+            return "stale mark"
+        marks = {s: p for s, (p, _) in self._marks.items()}
+        total = sum(a.equity(marks) for a in self.accounts.values())
+        gross, team_qty = self._current_exposure(marks)
+        notional = qty * price
+        if gross + working + notional > total * self.limits.max_gross_exposure_pct / 100.0 + 1e-9:
+            return "gross exposure cap"
+        mine = team_qty.get(symbol, 0.0) * marks[symbol] + sum(
+            (lot.qty - lot.bought) * (lot.limit or lot.signal_price)
+            for lot in self.desk.lots.values()
+            if lot.symbol == symbol and lot.entry_order and not lot.entry_done
+        )
+        if mine + notional > total * self.limits.max_symbol_exposure_pct / 100.0 + 1e-9:
+            return "symbol exposure cap"
+        return ""
 
     # helpers --------------------------------------------------------------------------
     def _cancel_unfilled(self, order):

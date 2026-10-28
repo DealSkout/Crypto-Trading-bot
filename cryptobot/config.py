@@ -83,6 +83,9 @@ class CostConfig:
     spread_bps: float = 5.0
     slippage_bps: float = 5.0
     stop_gap_bps: float = 10.0  # extra adverse move on simulated stop exits
+    maker_fee_pct: float | None = None  # resting limit fills (Alpaca: 0.15); None = fee_pct
+    min_edge_multiple: float = 0.0  # skip trades whose expected move < this x round trip; 0 = off
+    no_target_move_r: float = 2.0  # expected move of a trade with no target, in stop distances
 
 
 @dataclass
@@ -91,6 +94,14 @@ class OrderConfig:
     entry_type: str = "market"  # market | limit (a marketable limit, see limit_offset_bps)
     limit_offset_bps: float = 10.0  # limit price this far through the last price
     fill_timeout_seconds: float = 30.0
+    # simulated brokers with entry_type "limit": the entry rests as a maker limit order at the
+    # signal price less maker_offset_bps and is cancelled if not filled within this many bars
+    maker_offset_bps: float = 0.0
+    entry_timeout_bars: int = 3
+    # the team router: exits that are not stop-outs rest as a limit at the last price for this
+    # long, then go to the market so a position is never left open
+    exit_timeout_seconds: float = 20.0
+    stop_limit_buffer_pct: float = 0.5  # broker stop-limit: the limit sits this far below the stop
     # a resting stop_limit sell at Alpaca behind every software stop, so a crashed process
     # still has protection. It sits backup_stop_buffer_pct beyond the software stop (0 = at
     # it: the exchange then usually fires first, at a better price than a polled stop).
@@ -423,8 +434,15 @@ def validate(cfg: Config) -> None:
     if not (0 <= rs.max_daily_cost_usd <= 5):
         raise ConfigError("research.max_daily_cost_usd must be between 0 and 5")
     c = cfg.costs
-    if min(c.commission, c.fee_pct, c.spread_bps, c.slippage_bps, c.stop_gap_bps) < 0:
+    if min(c.commission, c.fee_pct, c.spread_bps, c.slippage_bps, c.stop_gap_bps,
+           c.min_edge_multiple, c.no_target_move_r) < 0 or (
+        c.maker_fee_pct is not None and c.maker_fee_pct < 0
+    ):
         raise ConfigError("costs must not be negative")
+    if not (0 <= o.maker_offset_bps <= 200) or o.entry_timeout_bars < 1:
+        raise ConfigError("orders: 0 <= maker_offset_bps <= 200 and entry_timeout_bars >= 1")
+    if o.exit_timeout_seconds <= 0 or not (0 < o.stop_limit_buffer_pct <= 10):
+        raise ConfigError("orders: exit_timeout_seconds > 0 and 0 < stop_limit_buffer_pct <= 10")
     lc = cfg.learning
     if not (0.3 <= lc.train_fraction <= 0.9):
         raise ConfigError("learning.train_fraction must be between 0.3 and 0.9")

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -56,6 +57,7 @@ class OpenTrade:
     regime: str = ""
     features: str = ""  # JSON of the features at the entry decision
     entry_slippage_bps: float = 0.0
+    lot_id: str = ""  # one id per position, shared with the team router
 
 
 @dataclass
@@ -81,9 +83,23 @@ class TradeRecord:
     exit_slippage_bps: float = 0.0
     fees: float = 0.0
     features: str = ""
+    planned_r: float | None = None  # R at the planned exit level, before any costs
+    actual_r: float | None = None  # net P&L in units of the planned risk
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class RestingEntry:
+    """A simulated maker limit entry waiting for the market to trade through it."""
+
+    lot_id: str
+    signal: Signal
+    qty: float
+    limit: float
+    placed_ts: datetime
+    expires_ts: datetime  # bar start time from which it is cancelled if still unfilled
 
 
 class Engine:
@@ -125,6 +141,13 @@ class Engine:
         # or live) fill the market order immediately, which is moments after the close anyway.
         self.fill_next_open = bool(getattr(broker, "delayed_entry", False))
         self.pending: dict[str, tuple[Signal, datetime]] = {}
+        # resting maker entries (simulated brokers, orders.entry_type "limit"); each also
+        # holds a slot in `pending` so every "is anything waiting" check stays one lookup
+        self.limit_entries = self.fill_next_open and cfg.orders.entry_type == "limit"
+        self.resting: dict[str, RestingEntry] = {}
+        # execution events for the team router (None = nobody listens: backtests, solo bot)
+        self.outbox: list[dict[str, Any]] | None = None
+        self.dedupe_skips = True  # False: journal every refused entry, not once a day
         self._skip_seen: set[tuple[str, str]] = set()
         # the feature store: every decision is journalled with what was known at that moment
         self.version = "config"  # the model version trading (the registry sets this)
@@ -186,6 +209,8 @@ class Engine:
             )
         self.risk.start_day(day, self.equity())
         self._skip_seen.clear()
+        for symbol in list(self.resting):
+            self._cancel_resting(symbol, "a new UTC day started", ts)
         self.pending.clear()  # an overnight signal is stale; strategies re-signal
         self.day_pnl = self.day_costs = 0.0
         self.day_trades = 0
@@ -224,7 +249,9 @@ class Engine:
         if day != self.risk.state.day:
             self._start_day(day, ts)
 
-        if symbol in self.pending:
+        if symbol in self.resting:
+            self._work_resting(symbol, bar_open, bar_low, ts, sessions.minutes_to_close(market, ts))
+        elif symbol in self.pending:
             self._fill_pending(symbol, bar_open, ts, sessions.minutes_to_close(market, ts))
 
         self.broker.mark(symbol, price, ts)
@@ -254,6 +281,8 @@ class Engine:
             self._say(
                 f"DAILY LOSS STOP: {self.risk.state.halt_reason}. Flattening, done for today."
             )
+            for sym in list(self.resting):
+                self._cancel_resting(sym, "halted by the daily loss stop", ts)
             self.pending.clear()
             self._flatten("daily_loss", ts)
 
@@ -339,9 +368,14 @@ class Engine:
         return state
 
     def on_tick(self, symbol: str, price: float, ts: datetime) -> None:
-        """Between bars (live/paper): check software stops against the latest price."""
+        """Between bars (live/paper): check software stops against the latest price, and fill
+        a resting limit entry the moment the price trades at or through it."""
         self.broker.mark(symbol, price, ts)
         self.last_prices[symbol] = price
+        resting = self.resting.get(symbol)
+        if resting is not None and price <= resting.limit:
+            mtc = sessions.minutes_to_close(sessions.market_for(symbol), ts)
+            self._work_resting(symbol, price, price, ts, mtc, tick=True)
         for trade in list(self.lots(symbol)):
             decision = RiskManager.check_exit(
                 trade.side, trade.stop, trade.target, price, price, price
@@ -350,6 +384,7 @@ class Engine:
                 self._exit(symbol, decision.reason, decision.price, ts, trade=trade)
 
     def end_of_data(self, ts: datetime | None = None) -> None:
+        self.resting.clear()
         self.pending.clear()  # a signal on the very last bar has no next bar to fill on
         if self.open:
             last = ts or max(t.entry_ts for t in self._all_lots())
@@ -429,7 +464,7 @@ class Engine:
         while blocked would otherwise write a skip on every bar)."""
         self.skipped += 1  # every refusal counts...
         key = (symbol, why)
-        if key in self._skip_seen:
+        if self.dedupe_skips and key in self._skip_seen:
             return  # ...but is journalled once per symbol, reason and day
         self._skip_seen.add(key)
         self.journal.log("skip", why, symbol=symbol, data={"signal": asdict(sig)}, ts=ts)
@@ -464,6 +499,10 @@ class Engine:
             if not ok:
                 self._skip(symbol, why, sig, ts)
                 return False
+            edge = self._edge_check(sig)
+            if edge:
+                self._skip(symbol, edge, sig, ts)
+                return False
             self._size_mult[symbol] = mult
         for pause in self.pauses:  # macro windows, stale data: no NEW entries
             try:
@@ -473,6 +512,8 @@ class Engine:
             if paused:
                 self._skip(symbol, f"paused: {paused}", sig, ts)
                 return False
+        if defer and self.limit_entries:
+            return self._place_resting(symbol, sig, ts)
         if defer and self.fill_next_open:
             self.pending[symbol] = (sig, ts)
             self.journal.log(
@@ -503,6 +544,176 @@ class Engine:
             self.capped_entries += 1
         self._enter(symbol, sig, qty, ts, signal_price=signal_price)
         return symbol in self.open
+
+    def _edge_check(self, sig: Signal) -> str:
+        """Empty when the trade's expected move pays for its costs at least
+        costs.min_edge_multiple times over; else the reason it is skipped."""
+        cm = getattr(self.risk, "cost_model", None)
+        mult = float(getattr(cm, "min_edge_multiple", 0.0) or 0.0) if cm is not None else 0.0
+        if mult <= 0 or sig.entry <= 0:
+            return ""
+        if sig.target is not None:
+            move = abs(sig.target - sig.entry)
+            basis = "target"
+        else:
+            move = cm.no_target_move_r * sig.risk_per_unit
+            basis = f"{cm.no_target_move_r:g}x stop distance, no target"
+        move_pct = 100.0 * move / sig.entry
+        maker = self.cfg.orders.entry_type == "limit"
+        cost_pct = cm.round_trip_cost_pct(maker_entry=maker)
+        if move_pct < mult * cost_pct:
+            return (
+                f"edge filter: expected move {move_pct:.2f}% ({basis}) is under"
+                f" {mult:g}x the round-trip cost {cost_pct:.2f}%"
+            )
+        return ""
+
+    def _emit(self, event: dict[str, Any]) -> None:
+        if self.outbox is not None:
+            self.outbox.append(event)
+
+    def _place_resting(self, symbol: str, sig: Signal, ts: datetime) -> bool:
+        """Size the trade now and rest a maker limit buy at the signal price less
+        orders.maker_offset_bps; it fills only if the market trades down to it."""
+        orders = self.cfg.orders
+        sign = 1.0 if sig.side == "long" else -1.0
+        limit = sig.entry * (1 - sign * orders.maker_offset_bps / 10_000.0)
+        if (sig.side == "long" and limit <= sig.stop) or (sig.side == "short" and limit >= sig.stop):
+            self._skip(symbol, "maker limit would sit beyond the stop", sig, ts)
+            return False
+        rest_sig = Signal(sig.side, limit, sig.stop, sig.target, reason=sig.reason)
+        mult = min(1.0, max(0.0, self._size_mult.pop(symbol, 1.0)))
+        risk_pct, daily_vol = self._sizing_inputs(symbol)
+        qty, why = self.risk.position_size(
+            self.equity(),
+            self.broker.get_cash(),
+            limit,
+            sig.stop,
+            lambda q: self.broker.round_qty_for(symbol, q * mult),
+            symbol=symbol,
+            open_exposure=self.open_exposure(),
+            risk_pct=risk_pct,
+            daily_vol_pct=daily_vol,
+        )
+        if qty <= 0:
+            self._skip(symbol, why, sig, ts)
+            return False
+        tf = timedelta(minutes=int(self.cfg.timeframe_minutes))
+        resting = RestingEntry(
+            lot_id=uuid.uuid4().hex[:12],
+            signal=Signal(sig.side, sig.entry, sig.stop, sig.target, reason=sig.reason),
+            qty=qty,
+            limit=limit,
+            placed_ts=ts,
+            expires_ts=ts + tf * (1 + orders.entry_timeout_bars),
+        )
+        self.resting[symbol] = resting
+        self.pending[symbol] = (rest_sig, ts)
+        self.journal.log(
+            "signal",
+            f"{sig.reason} (maker limit {limit:.4f} for {qty}, {orders.entry_timeout_bars} bars)",
+            symbol=symbol,
+            data=asdict(sig),
+            ts=ts,
+        )
+        self._emit({
+            "type": "entry", "lot": resting.lot_id, "symbol": symbol, "side": sig.side,
+            "qty": qty, "limit": limit, "stop": sig.stop, "target": sig.target,
+            "signal_price": sig.entry,
+            # wall-clock deadline for the real order: the bars it may rest after this one
+            "expires": ts + tf * (1 + orders.entry_timeout_bars),
+        })
+        return True
+
+    def _cancel_resting(self, symbol: str, why: str, ts: datetime) -> None:
+        resting = self.resting.pop(symbol, None)
+        self.pending.pop(symbol, None)
+        if resting is None:
+            return
+        self._skip(symbol, f"entry limit cancelled: {why}", resting.signal, ts)
+        self._emit({"type": "entry_cancel", "lot": resting.lot_id, "symbol": symbol, "reason": why})
+
+    def _work_resting(
+        self, symbol: str, bar_open: float, bar_low: float, ts: datetime, mtc: float,
+        tick: bool = False,
+    ) -> None:
+        """Fill the resting limit if this bar (or tick) traded at or through it; cancel it
+        once its time is up."""
+        resting = self.resting[symbol]
+        sig = resting.signal
+        if self.risk.state.halted:
+            self._cancel_resting(symbol, f"halted: {self.risk.state.halt_reason}", ts)
+            return
+        if bar_low <= resting.limit:
+            price = min(resting.limit, bar_open)  # a gap down fills a resting buy at the open
+            if price <= sig.stop:
+                self._cancel_resting(symbol, "price gapped through the stop before the fill", ts)
+                return
+            self.resting.pop(symbol)
+            self.pending.pop(symbol, None)
+            fill = Signal(sig.side, price, sig.stop, sig.target, reason=sig.reason)
+            ok, why = self.risk.can_enter(symbol, sig.side, self.total_lots(), mtc)
+            if not ok:
+                self._skip(symbol, why, sig, ts)
+                self._emit({"type": "entry_cancel", "lot": resting.lot_id, "symbol": symbol,
+                            "reason": why})
+                return
+            self._enter(
+                symbol, fill, resting.qty, ts, signal_price=sig.entry,
+                lot_id=resting.lot_id, maker_price=price,
+            )
+            return
+        if not tick and ts >= resting.expires_ts:
+            self._cancel_resting(
+                symbol, f"not filled within {self.cfg.orders.entry_timeout_bars} bars", ts
+            )
+
+    def cancel_lot(self, lot_id: str, why: str, ts: datetime | None = None) -> bool:
+        """The router refused or could not place this entry: drop the resting order."""
+        for symbol, resting in list(self.resting.items()):
+            if resting.lot_id == lot_id:
+                self._cancel_resting(symbol, why, ts or datetime.now(UTC))
+                return True
+        return False
+
+    def shrink_lot(self, lot_id: str, real_qty: float, ts: datetime | None = None) -> bool:
+        """The real account filled less of this entry than the simulation did: undo the
+        difference at the entry price (no fee, no P&L), removing the lot if nothing filled."""
+        for symbol, lots in list(self.open.items()):
+            for trade in list(lots):
+                if trade.lot_id != lot_id:
+                    continue
+                delta = trade.qty - max(0.0, real_qty)
+                if delta <= 1e-12:
+                    return False
+                self.broker.adjust(symbol, -delta if trade.side == "long" else delta,
+                                   trade.entry_price)
+                share = delta / trade.qty
+                self.broker.cash += trade.fees * share  # the fee on the part that never filled
+                trade.fees -= trade.fees * share
+                trade.qty -= delta
+                self.journal.log(
+                    "entry_shortfall",
+                    f"the broker filled {max(0.0, real_qty)} of {trade.qty + delta}; the rest"
+                    " of the simulated entry was undone",
+                    symbol=symbol, ts=ts,
+                )
+                if trade.qty <= 1e-12:
+                    lots.remove(trade)
+                    if not lots:
+                        del self.open[symbol]
+                return True
+        return False
+
+    def close_lot_at(self, lot_id: str, price: float, reason: str, ts: datetime) -> bool:
+        """The real position closed at the broker (its stop filled): close the simulated lot
+        at that same price so the bot's books follow the account."""
+        for symbol, lots in list(self.open.items()):
+            for trade in list(lots):
+                if trade.lot_id == lot_id:
+                    self._exit(symbol, reason, price, ts, trade=trade, notify=False)
+                    return True
+        return False
 
     def _sizing_inputs(self, symbol: str) -> tuple[float | None, float | None]:
         """(quarter-Kelly risk %, the asset's daily vol %) for the configured sizing method.
@@ -717,13 +928,19 @@ class Engine:
         qty: float,
         ts: datetime,
         signal_price: float | None = None,
+        lot_id: str = "",
+        maker_price: float | None = None,
     ) -> None:
         side = "buy" if sig.side == "long" else "sell"
         if signal_price is None:
             self.journal.log("signal", sig.reason, symbol=symbol, data=asdict(sig), ts=ts)
         orders = self.cfg.orders
         try:
-            if orders.entry_type == "limit" and getattr(self.broker, "supports_limit", False):
+            if maker_price is not None:  # a simulated resting limit the market traded through
+                order = self.broker.place_order(
+                    symbol, side, qty, order_type="limit", limit_price=maker_price
+                )
+            elif orders.entry_type == "limit" and getattr(self.broker, "supports_limit", False):
                 last = self.last_prices.get(symbol, sig.entry)
                 offset = orders.limit_offset_bps / 10_000.0
                 limit = last * (1 + offset) if side == "buy" else last * (1 - offset)
@@ -785,6 +1002,7 @@ class Engine:
             risk_per_unit=sig.risk_per_unit,
             reason=sig.reason,
             signal_price=float(signal_price if signal_price is not None else sig.entry),
+            lot_id=lot_id or uuid.uuid4().hex[:12],
         ))
         trade = self.open[symbol][-1]
         ref = trade.signal_price
@@ -811,6 +1029,11 @@ class Engine:
             # the broker tracks ONE resting stop per symbol, so only the first lot gets it
             trade.backup_order_id = self._place_backup_stop(symbol, trade, ts)
         self.risk.record_entry(symbol)
+        self._emit({
+            "type": "entry_fill" if maker_price is not None else "entry_market",
+            "lot": trade.lot_id, "symbol": symbol, "side": sig.side, "qty": qty, "price": price,
+            "stop": sig.stop, "target": sig.target, "signal_price": trade.signal_price,
+        })
         self.journal.log(
             "entry",
             f"{sig.side} {qty} {symbol} @ {price:.4f} stop {sig.stop:.4f}"
@@ -870,6 +1093,7 @@ class Engine:
         ref_price: float,
         ts: datetime,
         trade: OpenTrade | None = None,
+        notify: bool = True,
     ) -> None:
         lots = self.lots(symbol)
         if not lots:
@@ -919,6 +1143,20 @@ class Engine:
         pnl = gross - explicit  # implicit costs are already inside the fill prices
         risk_amount = trade.risk_per_unit * trade.qty
         r_multiple = pnl / risk_amount if risk_amount > 0 else 0.0
+        # planned vs actual R, both on the PLANNED risk (signal price to stop): the gap is
+        # what slippage past the stop and the costs took
+        planned_risk = abs(trade.signal_price - trade.stop) if trade.signal_price else 0.0
+        if reason in ("stop", "backup_stop", "broker_stop"):
+            planned_exit = trade.stop
+        elif reason == "target" and trade.target is not None:
+            planned_exit = trade.target
+        else:
+            planned_exit = ref_price
+        planned_r = (
+            (planned_exit - trade.signal_price) * direction / planned_risk
+            if planned_risk > 0 else None
+        )
+        actual_r = pnl / (planned_risk * trade.qty) if planned_risk > 0 else None
         rec = TradeRecord(
             symbol=symbol,
             side=trade.side,
@@ -945,6 +1183,8 @@ class Engine:
             ),
             fees=explicit,
             features=trade.features,
+            planned_r=planned_r,
+            actual_r=actual_r,
         )
         self.trades.append(rec)
         trade_id = self.journal.record_trade(rec.to_dict(), strategy=self.strategy_name)
@@ -972,14 +1212,23 @@ class Engine:
                 )
             except Exception as e:  # pragma: no cover
                 log.warning("decision journal write failed: %s", e)
+        r_note = (
+            f"; planned {planned_r:+.2f}R, actual {actual_r:+.2f}R"
+            if planned_r is not None and actual_r is not None else ""
+        )
         self.journal.log(
             "exit",
             f"{reason}: {trade.side} {trade.qty} {symbol} @ {exit_price:.4f}"
-            f" pnl {pnl:+.2f} ({r_multiple:+.2f}R)",
+            f" pnl {pnl:+.2f} ({r_multiple:+.2f}R){r_note}",
             symbol=symbol,
-            data={"pnl": pnl, "r": r_multiple, "costs": rec.costs},
+            data={"pnl": pnl, "r": r_multiple, "costs": rec.costs,
+                  "planned_r": planned_r, "actual_r": actual_r},
             ts=ts,
         )
+        if notify:
+            self._emit({"type": "exit", "lot": trade.lot_id, "symbol": symbol,
+                        "side": trade.side, "qty": trade.qty, "price": exit_price,
+                        "reason": reason})
         self.day_pnl += pnl
         self.day_costs += rec.costs
         self.day_trades += 1

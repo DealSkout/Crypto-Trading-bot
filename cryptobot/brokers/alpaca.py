@@ -93,6 +93,7 @@ class AlpacaCryptoBroker(Broker):
         self.client = client
         self._assets: dict[str, tuple[float, float]] = {}
         self._protective: dict[str, str] = {}  # symbol -> resting stop-limit order id
+        self._price_steps: dict[str, float] = {}
 
     # plumbing -----------------------------------------------------------------------------
     def _call(self, what: str, fn, *args, **kwargs):
@@ -170,6 +171,26 @@ class AlpacaCryptoBroker(Broker):
                 self._assets[symbol] = (0.0, DEFAULT_INCREMENT)
         return self._assets[symbol]
 
+    def price_increment(self, symbol: str) -> float:
+        """The pair's minimum price step (Alpaca rejects limit and stop prices off it)."""
+        symbol = normalize(symbol)
+        if symbol not in self._price_steps:
+            step = 0.0
+            try:
+                step = _num(getattr(self.client.get_asset(symbol), "price_increment", 0))
+            except Exception as e:
+                log.warning("price increment for %s unknown (%s)", symbol, e)
+            self._price_steps[symbol] = step
+        return self._price_steps[symbol]
+
+    def round_price(self, symbol: str, price: float, up: bool = False) -> float:
+        step = self.price_increment(symbol)
+        if step <= 0:
+            return round(float(price), 8)
+        steps = price / step
+        steps = math.ceil(steps - 1e-9) if up else math.floor(steps + 1e-9)
+        return round(steps * step, 10)
+
     def round_qty_for(self, symbol: str, qty: float) -> float:
         min_size, inc = self.asset_limits(symbol)
         if qty <= 0:
@@ -237,12 +258,18 @@ class AlpacaCryptoBroker(Broker):
         elif order_type == "limit":
             if not limit_price:
                 raise BrokerError("a limit order needs limit_price")
-            req = LimitOrderRequest(**common, limit_price=round(limit_price, 8))
+            # a buy limit rounds down and a sell limit up: never less passive than asked
+            req = LimitOrderRequest(
+                **common, limit_price=self.round_price(symbol, limit_price, up=side == "sell")
+            )
         else:
             if not limit_price or not stop_price:
                 raise BrokerError("a stop_limit order needs stop_price and limit_price")
+            up = side == "buy"  # a protective sell stop rounds down, a buy stop up
             req = StopLimitOrderRequest(
-                **common, stop_price=round(stop_price, 8), limit_price=round(limit_price, 8)
+                **common,
+                stop_price=self.round_price(symbol, stop_price, up=up),
+                limit_price=self.round_price(symbol, limit_price, up=up),
             )
         return self._to_order(self._call("order", self.client.submit_order, order_data=req))
 
