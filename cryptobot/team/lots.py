@@ -226,10 +226,11 @@ class LotDesk:
         return self._poll(lot, order_id, now)
 
     # ------------------------------------------------------------------ the tick
-    def work(self, now: datetime) -> list[dict]:
+    def work(self, now: datetime, symbols: set[str] | None = None) -> list[dict]:
+        """Poll and act on every open lot (or only those in `symbols`)."""
         reports: list[dict] = []
         for lot in list(self.lots.values()):
-            if lot.closed:
+            if lot.closed or (symbols is not None and lot.symbol not in symbols):
                 continue
             try:
                 reports += self._work_lot(lot, now)
