@@ -168,8 +168,19 @@ class TeamStore:
             "INSERT OR REPLACE INTO bot_metrics_daily (day, bot_id, equity, pnl, trades, sharpe,"
             " drawdown_pct, regime, start_equity, transfers, realized_pnl)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (day, bot_id, equity, pnl, trades, sharpe, drawdown_pct, regime, start_equity,
-             transfers, realized_pnl),
+            (
+                day,
+                bot_id,
+                equity,
+                pnl,
+                trades,
+                sharpe,
+                drawdown_pct,
+                regime,
+                start_equity,
+                transfers,
+                realized_pnl,
+            ),
         )
 
     # regimes ---------------------------------------------------------------------------
@@ -242,8 +253,7 @@ class TeamStore:
             " ORDER BY id"
         ).fetchall()
         return [
-            {"id": r[0], "ts": r[1], "symbol": r[2], "side": r[3], "entry_mark": r[4]}
-            for r in rows
+            {"id": r[0], "ts": r[1], "symbol": r[2], "side": r[3], "entry_mark": r[4]} for r in rows
         ]
 
     def score_consensus(self, consensus_id: int, outcome_pnl: float) -> None:
@@ -328,13 +338,26 @@ class TeamStore:
             "INSERT INTO real_trades (bot_id, symbol, lot, entry_ts, exit_ts, qty, entry_price,"
             " exit_price, signal_price, stop, target, reason, gross_pnl, fees, slippage, net_pnl,"
             " planned_r, actual_r) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (r["bot_id"], r["symbol"], r.get("lot", ""),
-             _iso(r.get("entry_ts")) if r.get("entry_ts") else None,
-             _iso(r.get("exit_ts")) if r.get("exit_ts") else None,
-             r.get("qty"), r.get("entry_price"), r.get("exit_price"), r.get("signal_price"),
-             r.get("stop"), r.get("target"), r.get("reason", ""), r.get("gross_pnl"),
-             r.get("fees"), r.get("slippage"), r.get("net_pnl"), r.get("planned_r"),
-             r.get("actual_r")),
+            (
+                r["bot_id"],
+                r["symbol"],
+                r.get("lot", ""),
+                _iso(r.get("entry_ts")) if r.get("entry_ts") else None,
+                _iso(r.get("exit_ts")) if r.get("exit_ts") else None,
+                r.get("qty"),
+                r.get("entry_price"),
+                r.get("exit_price"),
+                r.get("signal_price"),
+                r.get("stop"),
+                r.get("target"),
+                r.get("reason", ""),
+                r.get("gross_pnl"),
+                r.get("fees"),
+                r.get("slippage"),
+                r.get("net_pnl"),
+                r.get("planned_r"),
+                r.get("actual_r"),
+            ),
         )
 
     def real_trades(self, bot_id: str | None = None) -> pd.DataFrame:
@@ -345,7 +368,9 @@ class TeamStore:
         return pd.read_sql_query(q + " ORDER BY id", self.conn, params=args)
 
     # runtime state (survives a restart) -------------------------------------------------
-    def save_bot_state(self, bot_id: str, state: dict[str, Any], ts: datetime | None = None) -> None:
+    def save_bot_state(
+        self, bot_id: str, state: dict[str, Any], ts: datetime | None = None
+    ) -> None:
         self._write(
             "INSERT INTO bot_state (bot_id, state_json, updated_ts) VALUES (?,?,?)"
             " ON CONFLICT(bot_id) DO UPDATE SET state_json = excluded.state_json,"

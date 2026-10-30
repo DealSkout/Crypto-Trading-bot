@@ -3,7 +3,6 @@ in simulation, the execution outbox, and planned vs actual R on every trade."""
 
 from datetime import timedelta
 
-import pandas as pd
 import pytest
 
 from cryptobot.backtest import cost_model
@@ -68,7 +67,8 @@ def test_edge_filter_skips_a_target_too_close_for_the_costs(cfg):
     feed(engine, bars_from_closes([100.0] * 6))
     assert not engine.open and not engine.pending
     skips = engine.journal.events(kinds=["skip"])
-    assert len(skips) == 1 and skips.iloc[0]["message"].startswith("edge filter: expected move 1.00%")
+    assert len(skips) == 1
+    assert skips.iloc[0]["message"].startswith("edge filter: expected move 1.00%")
 
 
 def test_edge_filter_lets_a_big_enough_move_through(cfg):
@@ -129,8 +129,9 @@ def _window(df, n):
 
 
 def test_limit_entry_is_cancelled_when_the_market_runs_away(cfg):
-    engine = make_engine(limit_cfg(cfg, timeout=2),
-                         StubStrategy(fire_at=3, stop_pct=2.0, target_pct=5.0))
+    engine = make_engine(
+        limit_cfg(cfg, timeout=2), StubStrategy(fire_at=3, stop_pct=2.0, target_pct=5.0)
+    )
     df = bars_from_closes([100.0, 100.0, 100.0, 101.0, 102.0, 103.0, 104.0], wick=0.0)
     df = with_low(df, 3, 100.5, open_=100.5)  # never back down to 100
     for n in range(1, len(df) + 1):

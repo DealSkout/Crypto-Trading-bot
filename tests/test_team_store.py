@@ -203,19 +203,44 @@ def test_events_round_trip(store):
 
 
 def test_daily_metrics_carry_start_equity_and_transfers(store):
-    store.record_daily_metrics("2026-10-20", "b", equity=1010.0, pnl=-15.0, trades=2,
-                               start_equity=1000.0, transfers=25.0, realized_pnl=-12.0)
+    store.record_daily_metrics(
+        "2026-10-20",
+        "b",
+        equity=1010.0,
+        pnl=-15.0,
+        trades=2,
+        start_equity=1000.0,
+        transfers=25.0,
+        realized_pnl=-12.0,
+    )
     row = store.daily_metrics().iloc[0]
     assert row["start_equity"] == 1000.0 and row["transfers"] == 25.0
     assert row["realized_pnl"] == -12.0 and row["pnl"] == -15.0
 
 
 def test_real_trades_round_trip(store):
-    store.log_real_trade({"bot_id": "b1", "symbol": "BTC/USD", "lot": "x", "entry_ts": T0,
-                          "exit_ts": T1, "qty": 1.0, "entry_price": 100.0, "exit_price": 97.9,
-                          "signal_price": 100.0, "stop": 98.0, "target": 106.0, "reason": "stop",
-                          "gross_pnl": -2.0, "fees": 0.4, "slippage": 0.1, "net_pnl": -2.5,
-                          "planned_r": -1.0, "actual_r": -1.25})
+    store.log_real_trade(
+        {
+            "bot_id": "b1",
+            "symbol": "BTC/USD",
+            "lot": "x",
+            "entry_ts": T0,
+            "exit_ts": T1,
+            "qty": 1.0,
+            "entry_price": 100.0,
+            "exit_price": 97.9,
+            "signal_price": 100.0,
+            "stop": 98.0,
+            "target": 106.0,
+            "reason": "stop",
+            "gross_pnl": -2.0,
+            "fees": 0.4,
+            "slippage": 0.1,
+            "net_pnl": -2.5,
+            "planned_r": -1.0,
+            "actual_r": -1.25,
+        }
+    )
     row = store.real_trades("b1").iloc[0]
     assert row["net_pnl"] == -2.5 and row["planned_r"] == -1.0 and row["actual_r"] == -1.25
     assert row["gross_pnl"] - row["fees"] - row["slippage"] == pytest.approx(row["net_pnl"])

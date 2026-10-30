@@ -163,7 +163,8 @@ def test_last_resort_uses_rules_when_they_fire(cfg):
     d = Decider(dcfg(role="last_resort"), llm, Journal(":memory:"))
     engine = make_engine(cfg, StubStrategy(fire_at=1, stop_pct=1.0), d)
     feed(engine, bars_from_closes([100.0] * 4))
-    assert "BTC/USD" in engine.open and llm.calls == [] and engine.open["BTC/USD"][0].reason == "stub"
+    assert "BTC/USD" in engine.open and llm.calls == []
+    assert engine.open["BTC/USD"][0].reason == "stub"
 
 
 def test_last_resort_asks_model_when_rules_are_silent(cfg):

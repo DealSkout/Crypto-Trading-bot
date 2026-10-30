@@ -135,9 +135,9 @@ def adx(bars: pd.DataFrame, period: int = 14) -> float | None:
     plus_dm = up.where((up > down) & (up > 0), 0.0)
     minus_dm = down.where((down > up) & (down > 0), 0.0)
     prev_close = close.shift(1)
-    tr = pd.concat(
-        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
-    ).max(axis=1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(
+        axis=1
+    )
     alpha = 1.0 / period
     atr_series = tr.ewm(alpha=alpha, adjust=False).mean()
     plus_di = 100 * plus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_series

@@ -191,9 +191,7 @@ class Engine:
 
     def open_exposure(self) -> float:
         """Market value of every open position (the account-wide exposure cap uses this)."""
-        return sum(
-            t.qty * self.last_prices.get(t.symbol, t.entry_price) for t in self._all_lots()
-        )
+        return sum(t.qty * self.last_prices.get(t.symbol, t.entry_price) for t in self._all_lots())
 
     def _start_day(self, day, ts: datetime) -> None:
         prev = self.risk.state.day
@@ -578,7 +576,8 @@ class Engine:
         orders = self.cfg.orders
         sign = 1.0 if sig.side == "long" else -1.0
         limit = sig.entry * (1 - sign * orders.maker_offset_bps / 10_000.0)
-        if (sig.side == "long" and limit <= sig.stop) or (sig.side == "short" and limit >= sig.stop):
+        beyond = limit <= sig.stop if sig.side == "long" else limit >= sig.stop
+        if beyond:
             self._skip(symbol, "maker limit would sit beyond the stop", sig, ts)
             return False
         rest_sig = Signal(sig.side, limit, sig.stop, sig.target, reason=sig.reason)
@@ -616,13 +615,21 @@ class Engine:
             data=asdict(sig),
             ts=ts,
         )
-        self._emit({
-            "type": "entry", "lot": resting.lot_id, "symbol": symbol, "side": sig.side,
-            "qty": qty, "limit": limit, "stop": sig.stop, "target": sig.target,
-            "signal_price": sig.entry,
-            # wall-clock deadline for the real order: the bars it may rest after this one
-            "expires": ts + tf * (1 + orders.entry_timeout_bars),
-        })
+        self._emit(
+            {
+                "type": "entry",
+                "lot": resting.lot_id,
+                "symbol": symbol,
+                "side": sig.side,
+                "qty": qty,
+                "limit": limit,
+                "stop": sig.stop,
+                "target": sig.target,
+                "signal_price": sig.entry,
+                # wall-clock deadline for the real order: the bars it may rest after this one
+                "expires": ts + tf * (1 + orders.entry_timeout_bars),
+            }
+        )
         return True
 
     def _cancel_resting(self, symbol: str, why: str, ts: datetime) -> None:
@@ -634,7 +641,12 @@ class Engine:
         self._emit({"type": "entry_cancel", "lot": resting.lot_id, "symbol": symbol, "reason": why})
 
     def _work_resting(
-        self, symbol: str, bar_open: float, bar_low: float, ts: datetime, mtc: float,
+        self,
+        symbol: str,
+        bar_open: float,
+        bar_low: float,
+        ts: datetime,
+        mtc: float,
         tick: bool = False,
     ) -> None:
         """Fill the resting limit if this bar (or tick) traded at or through it; cancel it
@@ -655,12 +667,18 @@ class Engine:
             ok, why = self.risk.can_enter(symbol, sig.side, self.total_lots(), mtc)
             if not ok:
                 self._skip(symbol, why, sig, ts)
-                self._emit({"type": "entry_cancel", "lot": resting.lot_id, "symbol": symbol,
-                            "reason": why})
+                self._emit(
+                    {"type": "entry_cancel", "lot": resting.lot_id, "symbol": symbol, "reason": why}
+                )
                 return
             self._enter(
-                symbol, fill, resting.qty, ts, signal_price=sig.entry,
-                lot_id=resting.lot_id, maker_price=price,
+                symbol,
+                fill,
+                resting.qty,
+                ts,
+                signal_price=sig.entry,
+                lot_id=resting.lot_id,
+                maker_price=price,
             )
             return
         if not tick and ts >= resting.expires_ts:
@@ -686,8 +704,9 @@ class Engine:
                 delta = trade.qty - max(0.0, real_qty)
                 if delta <= 1e-12:
                     return False
-                self.broker.adjust(symbol, -delta if trade.side == "long" else delta,
-                                   trade.entry_price)
+                self.broker.adjust(
+                    symbol, -delta if trade.side == "long" else delta, trade.entry_price
+                )
                 share = delta / trade.qty
                 self.broker.cash += trade.fees * share  # the fee on the part that never filled
                 trade.fees -= trade.fees * share
@@ -696,7 +715,8 @@ class Engine:
                     "entry_shortfall",
                     f"the broker filled {max(0.0, real_qty)} of {trade.qty + delta}; the rest"
                     " of the simulated entry was undone",
-                    symbol=symbol, ts=ts,
+                    symbol=symbol,
+                    ts=ts,
                 )
                 if trade.qty <= 1e-12:
                     lots.remove(trade)
@@ -917,9 +937,8 @@ class Engine:
             or (decision.action == "buy" and trade.side == "short")
         )
         if closing:
-            self._exit(
-                symbol, "llm_close", self.last_prices.get(symbol, trade.entry_price), ts, trade=trade
-            )
+            price = self.last_prices.get(symbol, trade.entry_price)
+            self._exit(symbol, "llm_close", price, ts, trade=trade)
 
     def _enter(
         self,
@@ -989,21 +1008,23 @@ class Engine:
                         qty = have
                 except BrokerError:
                     pass
-        self.open.setdefault(symbol, []).append(OpenTrade(
-            symbol=symbol,
-            side=sig.side,
-            qty=qty,
-            entry_price=price,
-            entry_ts=ts,
-            stop=sig.stop,
-            target=sig.target,
-            fees=order.fees,
-            implicit_cost=order.implicit_cost,
-            risk_per_unit=sig.risk_per_unit,
-            reason=sig.reason,
-            signal_price=float(signal_price if signal_price is not None else sig.entry),
-            lot_id=lot_id or uuid.uuid4().hex[:12],
-        ))
+        self.open.setdefault(symbol, []).append(
+            OpenTrade(
+                symbol=symbol,
+                side=sig.side,
+                qty=qty,
+                entry_price=price,
+                entry_ts=ts,
+                stop=sig.stop,
+                target=sig.target,
+                fees=order.fees,
+                implicit_cost=order.implicit_cost,
+                risk_per_unit=sig.risk_per_unit,
+                reason=sig.reason,
+                signal_price=float(signal_price if signal_price is not None else sig.entry),
+                lot_id=lot_id or uuid.uuid4().hex[:12],
+            )
+        )
         trade = self.open[symbol][-1]
         ref = trade.signal_price
         sgn = 1.0 if sig.side == "long" else -1.0
@@ -1029,11 +1050,19 @@ class Engine:
             # the broker tracks ONE resting stop per symbol, so only the first lot gets it
             trade.backup_order_id = self._place_backup_stop(symbol, trade, ts)
         self.risk.record_entry(symbol)
-        self._emit({
-            "type": "entry_fill" if maker_price is not None else "entry_market",
-            "lot": trade.lot_id, "symbol": symbol, "side": sig.side, "qty": qty, "price": price,
-            "stop": sig.stop, "target": sig.target, "signal_price": trade.signal_price,
-        })
+        self._emit(
+            {
+                "type": "entry_fill" if maker_price is not None else "entry_market",
+                "lot": trade.lot_id,
+                "symbol": symbol,
+                "side": sig.side,
+                "qty": qty,
+                "price": price,
+                "stop": sig.stop,
+                "target": sig.target,
+                "signal_price": trade.signal_price,
+            }
+        )
         self.journal.log(
             "entry",
             f"{sig.side} {qty} {symbol} @ {price:.4f} stop {sig.stop:.4f}"
@@ -1154,7 +1183,8 @@ class Engine:
             planned_exit = ref_price
         planned_r = (
             (planned_exit - trade.signal_price) * direction / planned_risk
-            if planned_risk > 0 else None
+            if planned_risk > 0
+            else None
         )
         actual_r = pnl / (planned_risk * trade.qty) if planned_risk > 0 else None
         rec = TradeRecord(
@@ -1214,21 +1244,35 @@ class Engine:
                 log.warning("decision journal write failed: %s", e)
         r_note = (
             f"; planned {planned_r:+.2f}R, actual {actual_r:+.2f}R"
-            if planned_r is not None and actual_r is not None else ""
+            if planned_r is not None and actual_r is not None
+            else ""
         )
         self.journal.log(
             "exit",
             f"{reason}: {trade.side} {trade.qty} {symbol} @ {exit_price:.4f}"
             f" pnl {pnl:+.2f} ({r_multiple:+.2f}R){r_note}",
             symbol=symbol,
-            data={"pnl": pnl, "r": r_multiple, "costs": rec.costs,
-                  "planned_r": planned_r, "actual_r": actual_r},
+            data={
+                "pnl": pnl,
+                "r": r_multiple,
+                "costs": rec.costs,
+                "planned_r": planned_r,
+                "actual_r": actual_r,
+            },
             ts=ts,
         )
         if notify:
-            self._emit({"type": "exit", "lot": trade.lot_id, "symbol": symbol,
-                        "side": trade.side, "qty": trade.qty, "price": exit_price,
-                        "reason": reason})
+            self._emit(
+                {
+                    "type": "exit",
+                    "lot": trade.lot_id,
+                    "symbol": symbol,
+                    "side": trade.side,
+                    "qty": trade.qty,
+                    "price": exit_price,
+                    "reason": reason,
+                }
+            )
         self.day_pnl += pnl
         self.day_costs += rec.costs
         self.day_trades += 1

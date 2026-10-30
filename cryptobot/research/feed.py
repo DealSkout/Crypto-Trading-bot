@@ -25,7 +25,7 @@ from cryptobot.research.store import ResearchStore
 
 log = logging.getLogger(__name__)
 
-SOURCES = ("fear_greed", "funding", "open_interest", "news")
+SOURCES = ("fear_greed", "funding", "open_interest", "long_short", "news")
 
 
 class ResearchFeed:
@@ -106,6 +106,20 @@ class ResearchFeed:
             raise feeds.FeedError("; ".join(errors))
         return n
 
+    def _refresh_long_short(self, limit: int = 30) -> int:
+        n = 0
+        errors = []
+        for base in self.bases:
+            try:
+                n += self.store.upsert(
+                    "long_short", f"{base}@bybit", feeds.long_short_bybit(self.session, base, limit)
+                )
+            except feeds.FeedError as e:
+                errors.append(str(e))
+        if errors and not n:
+            raise feeds.FeedError("; ".join(errors))
+        return n
+
     def _refresh_news(self) -> int:
         items: list[dict[str, Any]] = []
         errors = []
@@ -149,6 +163,18 @@ class ResearchFeed:
             except feeds.FeedError as e:
                 errors.append(str(e))
         out["funding"] = f"ok ({n})" if n else f"error: {'; '.join(errors)}"
+        n, errors = 0, []
+        for base in self.bases:
+            try:
+                ex, rows = feeds.oi_history(self.session, base, days)
+                n += self.store.upsert("open_interest", f"{base}@{ex}", rows)
+            except feeds.FeedError as e:
+                errors.append(str(e))
+        out["open_interest"] = f"ok ({n})" if n else f"error: {'; '.join(errors)}"
+        try:
+            out["long_short"] = f"ok ({self._refresh_long_short(limit=500)})"
+        except Exception as e:
+            out["long_short"] = f"error: {e}"
         out.update(self.refresh(force=True))
         return out
 
@@ -226,6 +252,13 @@ class ResearchFeed:
             prev = self.store.asof("open_interest", f"{base}@{ex}", ts - timedelta(hours=24))
             if prev and prev["value"]:
                 out["oi_change_24h_pct"] = (row["value"] / prev["value"] - 1.0) * 100.0
+        out["oi_change_7d_pct"] = None
+        if o is not None:
+            prev = self.store.asof("open_interest", f"{base}@{ex}", ts - timedelta(days=7))
+            if prev and prev["value"]:
+                out["oi_change_7d_pct"] = (row["value"] / prev["value"] - 1.0) * 100.0
+        ls = self.store.asof("long_short", f"{base}@bybit", ts)
+        out["long_short_ratio"] = ls["value"] if ls else None  # share of accounts long, 0-1
         news = self.store.news(ts - timedelta(hours=24), ts)
         scores = news["score"].dropna() if len(news) else pd.Series(dtype=float)
         out["news_count_24h"] = int(len(news))

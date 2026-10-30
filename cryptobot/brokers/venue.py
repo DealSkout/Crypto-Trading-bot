@@ -56,8 +56,14 @@ class PaperVenue(PaperBroker):
             qty = max(0.0, self._qty.get(symbol, 0.0))
         oid = f"venue-{next(self._ids)}"
         self._book[oid] = {
-            "id": oid, "symbol": symbol, "side": side, "qty": float(qty), "type": order_type,
-            "limit": float(limit_price), "stop": float(stop_price or 0.0), "triggered": False,
+            "id": oid,
+            "symbol": symbol,
+            "side": side,
+            "qty": float(qty),
+            "type": order_type,
+            "limit": float(limit_price),
+            "stop": float(stop_price or 0.0),
+            "triggered": False,
         }
         price = self._prices.get(symbol)
         if price is not None:
@@ -118,15 +124,28 @@ class PaperVenue(PaperBroker):
         r = self._book.get(order_id)
         if r is None:
             raise BrokerError(f"unknown order {order_id}")
-        return Order(id=order_id, symbol=r["symbol"], side=r["side"], qty=r["qty"],
-                     type=r["type"], status="new", limit_price=r["limit"])
+        return Order(
+            id=order_id,
+            symbol=r["symbol"],
+            side=r["side"],
+            qty=r["qty"],
+            type=r["type"],
+            status="new",
+            limit_price=r["limit"],
+        )
 
     def cancel(self, order_id: str) -> None:
         r = self._book.pop(order_id, None)
         if r is not None:
             self._done[order_id] = Order(
-                id=order_id, symbol=r["symbol"], side=r["side"], qty=r["qty"], type=r["type"],
-                status="cancelled", limit_price=r["limit"], note="cancelled",
+                id=order_id,
+                symbol=r["symbol"],
+                side=r["side"],
+                qty=r["qty"],
+                type=r["type"],
+                status="cancelled",
+                limit_price=r["limit"],
+                note="cancelled",
             )
 
     def open_orders(self) -> list[Order]:

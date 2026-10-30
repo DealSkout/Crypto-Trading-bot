@@ -29,9 +29,18 @@ def price(router, symbol, p, ts=T0):
 
 
 def entry(lot="L1", qty=1.0, limit=100.0, stop=98.0, target=106.0, expires=None, symbol="BTC/USD"):
-    return {"type": "entry", "lot": lot, "symbol": symbol, "side": "long", "qty": qty,
-            "limit": limit, "stop": stop, "target": target, "signal_price": limit,
-            "expires": expires or T0 + timedelta(minutes=15)}
+    return {
+        "type": "entry",
+        "lot": lot,
+        "symbol": symbol,
+        "side": "long",
+        "qty": qty,
+        "limit": limit,
+        "stop": stop,
+        "target": target,
+        "signal_price": limit,
+        "expires": expires or T0 + timedelta(minutes=15),
+    }
 
 
 def work(router, now=T0):
@@ -112,8 +121,9 @@ def test_a_target_exit_rests_as_a_limit_then_goes_to_the_market(tmp_path):
     router.desk.on_event("a", {"type": "entry_fill", "lot": "L1", "qty": 1.0}, T0)
     work(router)
     price(router, "BTC/USD", 106.2)
-    router.desk.on_event("a", {"type": "exit", "lot": "L1", "qty": 1.0, "price": 106.0,
-                               "reason": "target"}, T0)
+    router.desk.on_event(
+        "a", {"type": "exit", "lot": "L1", "qty": 1.0, "price": 106.0, "reason": "target"}, T0
+    )
     work(router)
     limits = [o for o in venue.open_orders() if o.type == "limit" and o.side == "sell"]
     stops = [o for o in venue.open_orders() if o.type == "stop_limit"]
@@ -122,8 +132,9 @@ def test_a_target_exit_rests_as_a_limit_then_goes_to_the_market(tmp_path):
     reports = work(router, T0 + timedelta(seconds=25))  # past exit_timeout_seconds
     assert any(r.get("side") == "sell" for r in reports)
     assert venue.get_positions() == [] and venue.open_orders() == []
-    result = next(r for r in reports + work(router, T0 + timedelta(seconds=26))
-                  if r.get("lot_closed"))
+    result = next(
+        r for r in reports + work(router, T0 + timedelta(seconds=26)) if r.get("lot_closed")
+    )
     assert result["reason"] == "target" and result["planned_r"] == pytest.approx(3.0)
 
 
@@ -138,8 +149,9 @@ def test_a_stop_out_the_broker_could_not_fill_goes_to_the_market(tmp_path):
     price(router, "BTC/USD", 96.0)  # gapped through the stop AND its limit: the stop-limit rests
     work(router)
     assert venue.get_positions()  # still held: a stop-limit cannot fill below its limit
-    router.desk.on_event("a", {"type": "exit", "lot": "L1", "qty": 1.0, "price": 96.0,
-                               "reason": "stop"}, T0)
+    router.desk.on_event(
+        "a", {"type": "exit", "lot": "L1", "qty": 1.0, "price": 96.0, "reason": "stop"}, T0
+    )
     reports = work(router)
     assert venue.get_positions() == [] and venue.open_orders() == []
     assert [r for r in reports if r.get("side") == "sell"][0]["price"] == pytest.approx(96.0)
@@ -165,8 +177,9 @@ def test_opposing_bots_still_net_internally(tmp_path):
     orders_before = len(venue._done)
     price(router, "BTC/USD", 101.0)
     router.desk.on_event("a", entry(lot="A1", limit=101.0, stop=99.0, target=106.0), T0)
-    router.desk.on_event("b", {"type": "exit", "lot": "B1", "qty": 1.0, "price": 101.0,
-                               "reason": "rule"}, T0)
+    router.desk.on_event(
+        "b", {"type": "exit", "lot": "B1", "qty": 1.0, "price": 101.0, "reason": "rule"}, T0
+    )
     reports = work(router)
     cross = [r for r in reports if r.get("internal")]
     assert cross and cross[0]["bots"] == ["a", "b"] and cross[0]["price"] == pytest.approx(101.0)
