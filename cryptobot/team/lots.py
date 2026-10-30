@@ -86,8 +86,15 @@ class LotDesk:
     def orders(self):
         return self.r.order_settings
 
-    def _place(self, lot: Lot, side: str, qty: float, order_type: str = "market",
-               limit: float | None = None, stop: float | None = None) -> Order | None:
+    def _place(
+        self,
+        lot: Lot,
+        side: str,
+        qty: float,
+        order_type: str = "market",
+        limit: float | None = None,
+        stop: float | None = None,
+    ) -> Order | None:
         self.r.broker.set_order_tag(lot.bot_id)
         self.r.last_tag = lot.bot_id
         try:
@@ -95,8 +102,9 @@ class LotDesk:
                 lot.symbol, side, qty, order_type=order_type, limit_price=limit, stop_price=stop
             )
         except TypeError:  # an adapter without stop_price (PaperBroker): limit/market only
-            return self.r.broker.place_order(lot.symbol, side, qty, order_type=order_type,
-                                             limit_price=limit)
+            return self.r.broker.place_order(
+                lot.symbol, side, qty, order_type=order_type, limit_price=limit
+            )
         except BrokerError as e:
             log.warning("%s %s %s order failed: %s", lot.bot_id, lot.symbol, side, e)
             return None
@@ -124,20 +132,40 @@ class LotDesk:
 
     def _open(self, bot_id: str, ev: dict, now: datetime, market: bool) -> list[dict]:
         lot = Lot(
-            lot_id=ev["lot"], bot_id=bot_id, symbol=ev["symbol"], qty=float(ev["qty"]),
-            stop=float(ev["stop"]), target=ev.get("target"),
+            lot_id=ev["lot"],
+            bot_id=bot_id,
+            symbol=ev["symbol"],
+            qty=float(ev["qty"]),
+            stop=float(ev["stop"]),
+            target=ev.get("target"),
             signal_price=float(ev.get("signal_price") or ev.get("limit") or ev.get("price")),
             limit=None if market else float(ev["limit"]),
-            expires=ev.get("expires"), opened_ts=now,
-            sim="open" if market else "resting", sim_qty=float(ev["qty"]) if market else 0.0,
+            expires=ev.get("expires"),
+            opened_ts=now,
+            sim="open" if market else "resting",
+            sim_qty=float(ev["qty"]) if market else 0.0,
         )
-        reason = self.r.entry_precheck(bot_id, lot.symbol, lot.qty,
-                                       lot.limit or float(ev.get("price") or 0.0), now,
-                                       working=self.working_notional())
+        reason = self.r.entry_precheck(
+            bot_id,
+            lot.symbol,
+            lot.qty,
+            lot.limit or float(ev.get("price") or 0.0),
+            now,
+            working=self.working_notional(),
+        )
         if reason:
             lot.closed = True
-            return [{"rejected": True, "bot_id": bot_id, "symbol": lot.symbol, "lot": lot.lot_id,
-                     "reason": reason, "cancel_entry": not market, "unwind_sim": market}]
+            return [
+                {
+                    "rejected": True,
+                    "bot_id": bot_id,
+                    "symbol": lot.symbol,
+                    "lot": lot.lot_id,
+                    "reason": reason,
+                    "cancel_entry": not market,
+                    "unwind_sim": market,
+                }
+            ]
         if market:
             order = self._place(lot, "buy", lot.qty)
         else:
@@ -145,8 +173,17 @@ class LotDesk:
         if order is None or not order.id or order.status in ("rejected", "cancelled"):
             note = (order.note if order is not None else "") or "the broker refused the order"
             lot.closed = True
-            return [{"rejected": True, "bot_id": bot_id, "symbol": lot.symbol, "lot": lot.lot_id,
-                     "reason": note, "cancel_entry": not market, "unwind_sim": market}]
+            return [
+                {
+                    "rejected": True,
+                    "bot_id": bot_id,
+                    "symbol": lot.symbol,
+                    "lot": lot.lot_id,
+                    "reason": note,
+                    "cancel_entry": not market,
+                    "unwind_sim": market,
+                }
+            ]
         lot.entry_order = order.id
         self.lots[lot.lot_id] = lot
         return self._absorb(lot, order, now)
@@ -154,7 +191,8 @@ class LotDesk:
     def working_notional(self) -> float:
         return sum(
             (lot.qty - lot.bought) * (lot.limit or lot.signal_price)
-            for lot in self.lots.values() if lot.entry_order and not lot.entry_done
+            for lot in self.lots.values()
+            if lot.entry_order and not lot.entry_done
         )
 
     # ------------------------------------------------------------------ fills
@@ -193,10 +231,19 @@ class LotDesk:
             lot.fees += fee
             if lot.held <= EPS:
                 lot.held = 0.0
-        reports.append({
-            "internal": False, "bot_id": lot.bot_id, "symbol": lot.symbol, "side": order.side,
-            "qty": qty, "price": price, "fees": fee, "order_id": order.id, "lot": lot.lot_id,
-        })
+        reports.append(
+            {
+                "internal": False,
+                "bot_id": lot.bot_id,
+                "symbol": lot.symbol,
+                "side": order.side,
+                "qty": qty,
+                "price": price,
+                "fees": fee,
+                "order_id": order.id,
+                "lot": lot.lot_id,
+            }
+        )
         return reports
 
     def _fee(self, order: Order, qty: float, price: float, maker: bool) -> float:
@@ -253,26 +300,41 @@ class LotDesk:
                 reports += got
                 lot.entry_done = True
         # 2. the bot's side settled the entry: shrink its book to what really filled
-        if lot.sim == "open" and lot.entry_done and not lot.shrink_sent and (
-            lot.bought < lot.sim_qty - max(EPS, lot.sim_qty * 1e-6)
+        if (
+            lot.sim == "open"
+            and lot.entry_done
+            and not lot.shrink_sent
+            and (lot.bought < lot.sim_qty - max(EPS, lot.sim_qty * 1e-6))
         ):
             lot.shrink_sent = True
-            reports.append({"shrink": True, "bot_id": lot.bot_id, "lot": lot.lot_id,
-                            "real_qty": lot.bought})
+            reports.append(
+                {"shrink": True, "bot_id": lot.bot_id, "lot": lot.lot_id, "real_qty": lot.bought}
+            )
         # 3. protection: a resting stop-limit for whatever the lot holds
         # (real coins are protected as soon as they are bought, whatever the simulation is
         # doing, unless the bot is already leaving the position)
-        if (lot.held > EPS and lot.entry_done and not lot.stop_order
-                and lot.sim in ("resting", "open")):
+        if (
+            lot.held > EPS
+            and lot.entry_done
+            and not lot.stop_order
+            and lot.sim in ("resting", "open")
+        ):
             buffer = self.orders.stop_limit_buffer_pct / 100.0
-            order = self._place(lot, "sell", lot.held, "stop_limit",
-                                limit=lot.stop * (1 - buffer), stop=lot.stop)
+            order = self._place(
+                lot, "sell", lot.held, "stop_limit", limit=lot.stop * (1 - buffer), stop=lot.stop
+            )
             if order is not None and order.id and order.status not in ("rejected", "cancelled"):
                 lot.stop_order = order.id
                 reports += self._absorb(lot, order, now)
             else:
-                reports.append({"warning": True, "bot_id": lot.bot_id, "lot": lot.lot_id,
-                                "reason": "could not place the broker stop; software stop only"})
+                reports.append(
+                    {
+                        "warning": True,
+                        "bot_id": lot.bot_id,
+                        "lot": lot.lot_id,
+                        "reason": "could not place the broker stop; software stop only",
+                    }
+                )
         # 4. the broker's stop
         if lot.stop_order:
             order, got = self._poll(lot, lot.stop_order, now)
@@ -280,16 +342,27 @@ class LotDesk:
             if order is not None and order.is_done:
                 lot.stop_order = "" if order.status != "filled" else lot.stop_order
                 if lot.held <= EPS and lot.sim in ("resting", "open"):
-                    reports.append({"broker_stop": True, "bot_id": lot.bot_id, "lot": lot.lot_id,
-                                    "price": lot.proceeds / lot.sold if lot.sold else lot.stop})
+                    reports.append(
+                        {
+                            "broker_stop": True,
+                            "bot_id": lot.bot_id,
+                            "lot": lot.lot_id,
+                            "price": lot.proceeds / lot.sold if lot.sold else lot.stop,
+                        }
+                    )
                     lot.sim = "closed"
                     lot.exit_reason = "broker_stop"
                     lot.exit_ref = lot.stop
         # 5. closing: the bot exited, or its entry was cancelled with coins already bought
         if lot.sim in ("closed", "cancelled"):
             reports += self._close(lot, now)
-        if (lot.sim in ("closed", "cancelled") and lot.held <= EPS and lot.entry_done
-                and not lot.exit_order and not self._stop_working(lot)):
+        if (
+            lot.sim in ("closed", "cancelled")
+            and lot.held <= EPS
+            and lot.entry_done
+            and not lot.exit_order
+            and not self._stop_working(lot)
+        ):
             lot.closed = True
             lot.closed_ts = now
             if lot.bought > EPS:
@@ -358,8 +431,14 @@ class LotDesk:
     def _market_out(self, lot: Lot, now: datetime) -> list[dict]:
         order = self._place(lot, "sell", lot.held)
         if order is None:
-            return [{"warning": True, "bot_id": lot.bot_id, "lot": lot.lot_id,
-                     "reason": "market exit failed; retrying next tick"}]
+            return [
+                {
+                    "warning": True,
+                    "bot_id": lot.bot_id,
+                    "lot": lot.lot_id,
+                    "reason": "market exit failed; retrying next tick",
+                }
+            ]
         if order.id and not order.is_done:
             order = self.r.broker.await_fill(order, timeout=10.0)
         return self._absorb(lot, order, now)
@@ -376,9 +455,15 @@ class LotDesk:
         for buyer in self.lots.values():
             if seller.held <= EPS:
                 break
-            if (buyer is seller or buyer.bot_id == seller.bot_id or buyer.symbol != seller.symbol
-                    or buyer.entry_done or not buyer.entry_order or buyer.limit is None
-                    or buyer.limit < mark):
+            if (
+                buyer is seller
+                or buyer.bot_id == seller.bot_id
+                or buyer.symbol != seller.symbol
+                or buyer.entry_done
+                or not buyer.entry_order
+                or buyer.limit is None
+                or buyer.limit < mark
+            ):
                 continue
             _, got = self._cancel(buyer, buyer.entry_order, now)  # its own fills come first
             reports += got
@@ -400,9 +485,17 @@ class LotDesk:
             seller.sold += qty
             seller.proceeds += qty * mark
             seller.fees += sell_fee
-            reports.append({"internal": True, "bots": [buyer.bot_id, seller.bot_id],
-                            "symbol": seller.symbol, "qty": qty, "price": mark,
-                            "fees": buy_fee + sell_fee, "lots": [buyer.lot_id, seller.lot_id]})
+            reports.append(
+                {
+                    "internal": True,
+                    "bots": [buyer.bot_id, seller.bot_id],
+                    "symbol": seller.symbol,
+                    "qty": qty,
+                    "price": mark,
+                    "fees": buy_fee + sell_fee,
+                    "lots": [buyer.lot_id, seller.lot_id],
+                }
+            )
         return reports
 
     # ------------------------------------------------------------------ results
@@ -423,11 +516,23 @@ class LotDesk:
         net = lot.proceeds - lot.cost * (lot.sold / qty if qty else 0.0) - lot.fees
         slippage = gross_planned - (net + lot.fees)
         return {
-            "lot_closed": True, "bot_id": lot.bot_id, "symbol": lot.symbol, "lot": lot.lot_id,
-            "entry_ts": lot.opened_ts, "exit_ts": lot.closed_ts, "qty": lot.sold,
-            "entry_price": entry, "exit_price": exit_, "stop": lot.stop, "target": lot.target,
-            "signal_price": lot.signal_price, "reason": reason,
-            "gross_pnl": gross_planned, "fees": lot.fees, "slippage": slippage, "net_pnl": net,
+            "lot_closed": True,
+            "bot_id": lot.bot_id,
+            "symbol": lot.symbol,
+            "lot": lot.lot_id,
+            "entry_ts": lot.opened_ts,
+            "exit_ts": lot.closed_ts,
+            "qty": lot.sold,
+            "entry_price": entry,
+            "exit_price": exit_,
+            "stop": lot.stop,
+            "target": lot.target,
+            "signal_price": lot.signal_price,
+            "reason": reason,
+            "gross_pnl": gross_planned,
+            "fees": lot.fees,
+            "slippage": slippage,
+            "net_pnl": net,
             "planned_r": (planned_exit - lot.signal_price) / planned_risk if planned_risk else None,
             "actual_r": net / (planned_risk * lot.sold) if planned_risk and lot.sold else None,
         }

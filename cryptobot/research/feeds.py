@@ -195,7 +195,10 @@ def funding_history(session, base: str, days: int, exchanges: list[str]) -> tupl
 
 def oi_bybit(session, base: str, limit: int = 200, end: datetime | None = None) -> list[Row]:
     params: dict[str, Any] = {
-        "category": "linear", "symbol": f"{base}USDT", "intervalTime": "1h", "limit": limit,
+        "category": "linear",
+        "symbol": f"{base}USDT",
+        "intervalTime": "1h",
+        "limit": limit,
     }
     if end is not None:
         params["endTime"] = int(end.timestamp() * 1000)

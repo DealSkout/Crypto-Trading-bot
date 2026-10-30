@@ -428,11 +428,11 @@ def test_filters_skip_and_shrink_but_never_grow(cfg):
 def test_extra_candidates_enter_the_same_gate(cfg, monkeypatch):
     """Cross-learning and evolution candidates are appended to the pool and
     simulated like everything else, deduplicated by their key."""
-    from cryptobot.learning import Candidate, generate_challengers, run_learning
+    from cryptobot.learning import Candidate, run_learning
     from cryptobot.registry import Registry
 
     registry = Registry(":memory:")
-    champ = registry.sync_with_config("orb", {"range_minutes": 30, "target_r": 3})
+    registry.sync_with_config("orb", {"range_minutes": 30, "target_r": 3})
     labels = []
 
     def fake_sim(candidate):

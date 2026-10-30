@@ -43,8 +43,14 @@ class SlowBroker(PaperBroker):
     def place_order(self, symbol, side, qty, order_type="market", limit_price=None):
         part = super().place_order(symbol, side, qty * self.fill_fraction, order_type, limit_price)
         resting = Order(
-            id=part.id, symbol=symbol, side=side, qty=qty, status="partially_filled",
-            filled_qty=part.filled_qty, avg_fill_price=part.avg_fill_price, fees=part.fees,
+            id=part.id,
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            status="partially_filled",
+            filled_qty=part.filled_qty,
+            avg_fill_price=part.avg_fill_price,
+            fees=part.fees,
         )
         self._open[resting.id] = resting
         return resting

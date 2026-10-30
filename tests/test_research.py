@@ -112,9 +112,22 @@ class FakeSession:
             return Resp({"retCode": 0, "result": {"list": rows}})
         if "bybit.com" in url and "account-ratio" in url:
             days = [NOW.replace(hour=0) - timedelta(days=i) for i in range(1, 6)]
-            return Resp({"retCode": 0, "result": {"list": [
-                {"symbol": base, "buyRatio": str(0.60 + i / 100), "sellRatio": str(0.40 - i / 100),
-                 "timestamp": str(ms(d))} for i, d in enumerate(days)]}})
+            return Resp(
+                {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {
+                                "symbol": base,
+                                "buyRatio": str(0.60 + i / 100),
+                                "sellRatio": str(0.40 - i / 100),
+                                "timestamp": str(ms(d)),
+                            }
+                            for i, d in enumerate(days)
+                        ]
+                    },
+                }
+            )
         if "okx.com" in url and "open-interest" in url:
             return Resp({"code": "1", "msg": "nope"})
         if url.endswith("atom.xml"):
@@ -306,7 +319,6 @@ def test_digest_record_is_valid_json(cfg, feed):
     assert json.loads(row["data"])["digest"]["summary"]
 
 
-
 class PagedOI:
     """Bybit open interest, 200 hours a page, going back as far as endTime asks."""
 
@@ -317,8 +329,10 @@ class PagedOI:
         self.pages += 1
         end = datetime.fromtimestamp(int(params.get("endTime", ms(NOW))) / 1000, UTC)
         end = end.replace(minute=0, second=0, microsecond=0)
-        rows = [{"timestamp": str(ms(end - timedelta(hours=h))), "openInterest": "1000"}
-                for h in range(200)]
+        rows = [
+            {"timestamp": str(ms(end - timedelta(hours=h))), "openInterest": "1000"}
+            for h in range(200)
+        ]
         return Resp({"retCode": 0, "result": {"list": rows}})
 
 
@@ -342,7 +356,6 @@ def test_long_short_ratio_is_a_daily_feature_known_after_its_day(feed):
     assert early["long_short_ratio"] is None
 
 
-
 def test_funding_backfill_asks_exchanges_with_history_first():
     class Deep:
         def __init__(self):
@@ -353,10 +366,14 @@ def test_funding_backfill_asks_exchanges_with_history_first():
             if "binance.com" in url:
                 start = int((params or {}).get("startTime", ms(NOW)))
                 t0 = datetime.fromtimestamp(start / 1000, UTC)
-                rows = [{"fundingTime": ms(t0 + timedelta(hours=8 * i)), "fundingRate": "0.0001"}
-                        for i in range(1000) if t0 + timedelta(hours=8 * i) < NOW]
+                rows = [
+                    {"fundingTime": ms(t0 + timedelta(hours=8 * i)), "fundingRate": "0.0001"}
+                    for i in range(1000)
+                    if t0 + timedelta(hours=8 * i) < NOW
+                ]
                 return Resp(rows)
-            return Resp({"code": "0", "data": [{"fundingTime": str(ms(NOW)), "fundingRate": "0.0001"}]})
+            row = {"fundingTime": str(ms(NOW)), "fundingRate": "0.0001"}
+            return Resp({"code": "0", "data": [row]})
 
     s = Deep()
     ex, rows = feeds.funding_history(s, "BTC", 365, ["okx", "bybit", "binance"])

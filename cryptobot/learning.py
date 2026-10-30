@@ -529,7 +529,9 @@ def run_learning(
         seen.add(extra.key())
         if not extra.label:
             extra = Candidate(
-                extra.strategy, dict(extra.params), dict(extra.filters),
+                extra.strategy,
+                dict(extra.params),
+                dict(extra.filters),
                 label=_label(extra.strategy, extra.params, extra.filters),
             )
         cands.append(extra)

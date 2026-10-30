@@ -216,15 +216,17 @@ def test_placing_a_new_protective_stop_replaces_the_old_one():
 
 
 def test_limit_and_stop_prices_snap_to_the_price_increment():
-    c = FakeTradingClient(asset=NS(min_order_size="0.0001", min_trade_increment="0.0001",
-                                   price_increment="0.5"))
+    c = FakeTradingClient(
+        asset=NS(min_order_size="0.0001", min_trade_increment="0.0001", price_increment="0.5")
+    )
     b = broker(c)
     b.place_order("BTC/USD", "buy", 0.01, order_type="limit", limit_price=100.74)
     pos = [NS(symbol="BTCUSD", qty="1", avg_entry_price="100", asset_class="crypto")]
     c.positions = pos
     b.place_order("BTC/USD", "sell", 0.01, order_type="limit", limit_price=100.26)
-    b.place_order("BTC/USD", "sell", 0.01, order_type="stop_limit", stop_price=98.3,
-                  limit_price=97.81)
+    b.place_order(
+        "BTC/USD", "sell", 0.01, order_type="stop_limit", stop_price=98.3, limit_price=97.81
+    )
     buy, sell, stop = c.submitted
     assert buy.limit_price == 100.5  # a buy never pays more than asked
     assert sell.limit_price == 100.5  # a sell never takes less than asked

@@ -215,7 +215,11 @@ class ResearchConfig:
     calendar_warn_days: int = 45
     refresh_minutes: dict[str, float] = field(
         default_factory=lambda: {
-            "fear_greed": 60, "funding": 30, "open_interest": 30, "long_short": 360, "news": 20,
+            "fear_greed": 60,
+            "funding": 30,
+            "open_interest": 30,
+            "long_short": 360,
+            "news": 20,
         }
     )
     stale_after_minutes: dict[str, float] = field(
@@ -437,10 +441,15 @@ def validate(cfg: Config) -> None:
     if not (0 <= rs.max_daily_cost_usd <= 5):
         raise ConfigError("research.max_daily_cost_usd must be between 0 and 5")
     c = cfg.costs
-    if min(c.commission, c.fee_pct, c.spread_bps, c.slippage_bps, c.stop_gap_bps,
-           c.min_edge_multiple, c.no_target_move_r) < 0 or (
-        c.maker_fee_pct is not None and c.maker_fee_pct < 0
-    ):
+    if min(
+        c.commission,
+        c.fee_pct,
+        c.spread_bps,
+        c.slippage_bps,
+        c.stop_gap_bps,
+        c.min_edge_multiple,
+        c.no_target_move_r,
+    ) < 0 or (c.maker_fee_pct is not None and c.maker_fee_pct < 0):
         raise ConfigError("costs must not be negative")
     if not (0 <= o.maker_offset_bps <= 200) or o.entry_timeout_bars < 1:
         raise ConfigError("orders: 0 <= maker_offset_bps <= 200 and entry_timeout_bars >= 1")

@@ -188,7 +188,12 @@ class Router:
         return marked[0] if marked else None
 
     def entry_precheck(
-        self, bot_id: str, symbol: str, qty: float, price: float, ts: datetime,
+        self,
+        bot_id: str,
+        symbol: str,
+        qty: float,
+        price: float,
+        ts: datetime,
         working: float = 0.0,
     ) -> str:
         """Why a new entry may not be placed, or "" if it may: kill switch, missing or stale
