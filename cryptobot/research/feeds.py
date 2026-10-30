@@ -156,7 +156,10 @@ def funding_history(session, base: str, days: int, exchanges: list[str]) -> tupl
     """Backfill: page back through Binance (or Bybit) funding history for `days` days."""
     since = datetime.now(UTC) - timedelta(days=days)
     errors = []
-    for ex in exchanges:
+    # exchanges that page back through history first: OKX's public endpoint only returns
+    # its latest readings, so asking it first would end a year's backfill after a few days
+    deep = [e for e in ("binance", "bybit") if e in exchanges]
+    for ex in deep + [e for e in exchanges if e not in deep]:
         try:
             rows: list[Row] = []
             if ex == "binance":

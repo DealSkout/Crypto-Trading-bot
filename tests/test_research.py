@@ -340,3 +340,25 @@ def test_long_short_ratio_is_a_daily_feature_known_after_its_day(feed):
     assert "oi_change_7d_pct" in ctx
     early = feed.context("BTC/USD", NOW - timedelta(days=30))
     assert early["long_short_ratio"] is None
+
+
+
+def test_funding_backfill_asks_exchanges_with_history_first():
+    class Deep:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, params=None, timeout=None, headers=None):
+            self.calls.append(url.split("/")[2])
+            if "binance.com" in url:
+                start = int((params or {}).get("startTime", ms(NOW)))
+                t0 = datetime.fromtimestamp(start / 1000, UTC)
+                rows = [{"fundingTime": ms(t0 + timedelta(hours=8 * i)), "fundingRate": "0.0001"}
+                        for i in range(1000) if t0 + timedelta(hours=8 * i) < NOW]
+                return Resp(rows)
+            return Resp({"code": "0", "data": [{"fundingTime": str(ms(NOW)), "fundingRate": "0.0001"}]})
+
+    s = Deep()
+    ex, rows = feeds.funding_history(s, "BTC", 365, ["okx", "bybit", "binance"])
+    assert ex == "binance" and s.calls[0] == "fapi.binance.com"
+    assert max(r[0] for r in rows) - min(r[0] for r in rows) >= timedelta(days=350)  # a year
