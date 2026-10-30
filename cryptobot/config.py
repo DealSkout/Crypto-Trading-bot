@@ -214,13 +214,16 @@ class ResearchConfig:
     calendar_file: str = "macro_calendar.yaml"
     calendar_warn_days: int = 45
     refresh_minutes: dict[str, float] = field(
-        default_factory=lambda: {"fear_greed": 60, "funding": 30, "open_interest": 30, "news": 20}
+        default_factory=lambda: {
+            "fear_greed": 60, "funding": 30, "open_interest": 30, "long_short": 360, "news": 20,
+        }
     )
     stale_after_minutes: dict[str, float] = field(
         default_factory=lambda: {
             "fear_greed": 2880,
             "funding": 720,
             "open_interest": 360,
+            "long_short": 2880,
             "news": 720,
         }
     )
@@ -249,7 +252,7 @@ class RegimeConfig:
 
 
 VALID_EXCHANGES = ("okx", "bybit", "binance")
-RESEARCH_SOURCES = ("fear_greed", "funding", "open_interest", "news")
+RESEARCH_SOURCES = ("fear_greed", "funding", "open_interest", "long_short", "news")
 
 
 @dataclass

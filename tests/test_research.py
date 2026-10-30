@@ -110,6 +110,11 @@ class FakeSession:
                 for h in range(1, 30)
             ]
             return Resp({"retCode": 0, "result": {"list": rows}})
+        if "bybit.com" in url and "account-ratio" in url:
+            days = [NOW.replace(hour=0) - timedelta(days=i) for i in range(1, 6)]
+            return Resp({"retCode": 0, "result": {"list": [
+                {"symbol": base, "buyRatio": str(0.60 + i / 100), "sellRatio": str(0.40 - i / 100),
+                 "timestamp": str(ms(d))} for i, d in enumerate(days)]}})
         if "okx.com" in url and "open-interest" in url:
             return Resp({"code": "1", "msg": "nope"})
         if url.endswith("atom.xml"):
@@ -299,3 +304,39 @@ def test_digest_record_is_valid_json(cfg, feed):
     run_daily_digest(cfg, Journal(":memory:"), feed, NOW.date(), llm=None, now=NOW)
     row = feed.store.series("digest", "daily").iloc[-1]
     assert json.loads(row["data"])["digest"]["summary"]
+
+
+
+class PagedOI:
+    """Bybit open interest, 200 hours a page, going back as far as endTime asks."""
+
+    def __init__(self):
+        self.pages = 0
+
+    def get(self, url, params=None, timeout=None, headers=None):
+        self.pages += 1
+        end = datetime.fromtimestamp(int(params.get("endTime", ms(NOW))) / 1000, UTC)
+        end = end.replace(minute=0, second=0, microsecond=0)
+        rows = [{"timestamp": str(ms(end - timedelta(hours=h))), "openInterest": "1000"}
+                for h in range(200)]
+        return Resp({"retCode": 0, "result": {"list": rows}})
+
+
+def test_open_interest_history_pages_back_a_year():
+    s = PagedOI()
+    ex, rows = feeds.oi_history(s, "BTC", 365)
+    assert ex == "bybit" and s.pages == 44  # 365 days x 24 h / 200 h a page, rounded up
+    span = max(r[0] for r in rows) - min(r[0] for r in rows)
+    assert span >= timedelta(days=364) and all(r[1] - r[0] == feeds.OI_LAG for r in rows)
+
+
+def test_long_short_ratio_is_a_daily_feature_known_after_its_day(feed):
+    rows = feeds.long_short_bybit(FakeSession(), "BTC", 5)
+    assert len(rows) == 5 and rows[0][2] == pytest.approx(0.60)
+    assert rows[0][1] - rows[0][0] == feeds.LONG_SHORT_LAG
+    feed.refresh(force=True)
+    ctx = feed.context("BTC/USD", NOW)
+    assert ctx["long_short_ratio"] == pytest.approx(0.60)  # yesterday's ratio, published today
+    assert "oi_change_7d_pct" in ctx
+    early = feed.context("BTC/USD", NOW - timedelta(days=30))
+    assert early["long_short_ratio"] is None

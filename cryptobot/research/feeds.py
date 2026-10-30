@@ -190,12 +190,13 @@ def funding_history(session, base: str, days: int, exchanges: list[str]) -> tupl
 # ----------------------------------------------------------------------------- open interest
 
 
-def oi_bybit(session, base: str, limit: int = 200) -> list[Row]:
-    js = _json(
-        session,
-        "https://api.bybit.com/v5/market/open-interest",
-        {"category": "linear", "symbol": f"{base}USDT", "intervalTime": "1h", "limit": limit},
-    )
+def oi_bybit(session, base: str, limit: int = 200, end: datetime | None = None) -> list[Row]:
+    params: dict[str, Any] = {
+        "category": "linear", "symbol": f"{base}USDT", "intervalTime": "1h", "limit": limit,
+    }
+    if end is not None:
+        params["endTime"] = int(end.timestamp() * 1000)
+    js = _json(session, "https://api.bybit.com/v5/market/open-interest", params)
     if int(js.get("retCode", 0)) != 0:
         raise FeedError(f"bybit oi: {js.get('retMsg')}")
     return [
@@ -243,6 +244,52 @@ def oi_binance(session, base: str, limit: int = 500) -> list[Row]:
 
 
 OPEN_INTEREST = {"okx": oi_okx, "bybit": oi_bybit, "binance": oi_binance}
+
+
+def oi_history(session, base: str, days: int, max_pages: int = 60) -> tuple[str, list[Row]]:
+    """Backfill: page back through Bybit's hourly open interest (200 hours a page), which
+    reaches about a year back; the other exchanges' public history is a month or less."""
+    since = datetime.now(UTC) - timedelta(days=days)
+    rows: list[Row] = []
+    end = datetime.now(UTC)
+    for _ in range(max_pages):
+        page = oi_bybit(session, base, end=end)
+        if not page:
+            break
+        rows += page
+        oldest = min(r[0] for r in page)
+        if oldest <= since:
+            break
+        end = oldest - timedelta(seconds=1)
+    if not rows:
+        raise FeedError(f"open interest history for {base}: nothing returned")
+    return "bybit", [r for r in rows if r[0] >= since]
+
+
+# ----------------------------------------------------------------------------- long/short ratio
+
+LONG_SHORT_LAG = timedelta(days=1)  # a daily ratio is known once its day has ended
+
+
+def long_short_bybit(session, base: str, limit: int = 500, period: str = "1d") -> list[Row]:
+    """Share of Bybit accounts holding a long position in the coin's perpetual, per day:
+    the crowd's positioning (0.65 = 65% of accounts long)."""
+    js = _json(
+        session,
+        "https://api.bybit.com/v5/market/account-ratio",
+        {"category": "linear", "symbol": f"{base}USDT", "period": period, "limit": limit},
+    )
+    if int(js.get("retCode", 0)) != 0:
+        raise FeedError(f"bybit long/short: {js.get('retMsg')}")
+    return [
+        (
+            _ms(it["timestamp"]),
+            _ms(it["timestamp"]) + LONG_SHORT_LAG,
+            float(it["buyRatio"]),
+            {"exchange": "bybit", "sell_ratio": float(it.get("sellRatio") or 0.0)},
+        )
+        for it in (js.get("result") or {}).get("list") or []
+    ]
 
 
 def open_interest(session, base: str, exchanges: list[str]) -> tuple[str, list[Row]]:
