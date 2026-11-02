@@ -649,14 +649,16 @@ class Engine:
         mtc: float,
         tick: bool = False,
     ) -> None:
-        """Fill the resting limit if this bar (or tick) traded at or through it; cancel it
-        once its time is up."""
+        """Fill the resting limit if this bar (or tick) traded through it by
+        orders.limit_fill_through_bps (a bare touch may still be queued); cancel it once its
+        time is up."""
         resting = self.resting[symbol]
         sig = resting.signal
         if self.risk.state.halted:
             self._cancel_resting(symbol, f"halted: {self.risk.state.halt_reason}", ts)
             return
-        if bar_low <= resting.limit:
+        through = resting.limit * (1 - self.cfg.orders.limit_fill_through_bps / 10_000.0)
+        if bar_low <= through:
             price = min(resting.limit, bar_open)  # a gap down fills a resting buy at the open
             if price <= sig.stop:
                 self._cancel_resting(symbol, "price gapped through the stop before the fill", ts)

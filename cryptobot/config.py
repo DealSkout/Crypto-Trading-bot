@@ -98,6 +98,9 @@ class OrderConfig:
     # signal price less maker_offset_bps and is cancelled if not filled within this many bars
     maker_offset_bps: float = 0.0
     entry_timeout_bars: int = 3
+    # a resting limit only counts as filled once price trades this far THROUGH it: a touch
+    # alone often means the order is still queued behind others (0 = fill on touch)
+    limit_fill_through_bps: float = 2.0
     # the team router: exits that are not stop-outs rest as a limit at the last price for this
     # long, then go to the market so a position is never left open
     exit_timeout_seconds: float = 20.0
@@ -374,6 +377,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError(f"orders.entry_type must be one of {VALID_ENTRY_TYPES}")
     if not (0 <= o.limit_offset_bps <= 200) or o.fill_timeout_seconds <= 0:
         raise ConfigError("orders: 0 <= limit_offset_bps <= 200 and fill_timeout_seconds > 0")
+    if not (0 <= o.limit_fill_through_bps <= 100):
+        raise ConfigError("orders.limit_fill_through_bps must be between 0 and 100")
     if not (0 <= o.backup_stop_buffer_pct <= 10):
         raise ConfigError("orders.backup_stop_buffer_pct must be between 0 and 10")
     timeframe_minutes(cfg.timeframe)

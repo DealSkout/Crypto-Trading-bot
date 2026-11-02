@@ -5,7 +5,8 @@ working at the broker (maker limit entries, stop-limit protective stops, exit
 limits), so its local stand-in needs an order book of one: orders rest until
 mark() moves the price through them, exactly as they would at Alpaca.
 
-  limit buy      fills at its limit once price <= limit (maker); if the price was
+  limit buy      fills at its limit once price trades fill_through_bps below it
+                 (maker; a bare touch may still be queued); if the price was
                  already strictly below it when placed it fills at once (taker)
   limit sell     the mirror image
   stop_limit sell  triggers once price <= stop: fills at the price if that is
@@ -28,8 +29,9 @@ class PaperVenue(PaperBroker):
     supports_limit = True
     supports_protective_stop = True
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, fill_through_bps: float = 0.0, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.fill_through = fill_through_bps / 10_000.0
         self._book: dict[str, dict] = {}  # order id -> resting order state
         self._ids = itertools.count(1)
         self._done: dict[str, Order] = {}
@@ -92,8 +94,13 @@ class PaperVenue(PaperBroker):
             # a new limit AT the last price rests at the touch; only a strictly better
             # price makes it marketable on arrival
             crosses = price < limit if r["side"] == "buy" else price > limit
-        else:
+        elif r["triggered"]:
             crosses = price <= limit if r["side"] == "buy" else price >= limit
+        else:  # a resting maker order: price must trade through it, not just touch it
+            if r["side"] == "buy":
+                crosses = price <= limit * (1 - self.fill_through)
+            else:
+                crosses = price >= limit * (1 + self.fill_through)
         if not crosses:
             return
         taker = at_placement
