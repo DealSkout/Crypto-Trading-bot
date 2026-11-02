@@ -108,18 +108,41 @@ def test_limit_entry_fills_only_when_the_market_trades_through_it(cfg):
     engine = make_engine(limit_cfg(cfg), StubStrategy(fire_at=3, stop_pct=2.0, target_pct=5.0))
     closes = [100.0, 100.0, 100.0, 100.5, 100.4, 100.6]
     df = bars_from_closes(closes, wick=0.0)  # bar 4 opens 100.0, low 100.0: touches the limit
+    df = with_low(df, 4, 99.9)  # bar 5 trades 10 bps through it
     feed(engine, df.iloc[:3])
     assert "BTC/USD" in engine.resting and engine.resting["BTC/USD"].limit == pytest.approx(100.0)
     entry_event = engine.outbox[0]
     assert entry_event["type"] == "entry" and entry_event["limit"] == pytest.approx(100.0)
     assert entry_event["qty"] > 0 and entry_event["stop"] == pytest.approx(98.0)
     engine.on_bar("BTC/USD", _window(df, 4))
+    assert not engine.open and "BTC/USD" in engine.resting  # a bare touch is still queued
+    engine.on_bar("BTC/USD", _window(df, 5))
     lot = engine.open["BTC/USD"][0]
     assert lot.entry_price == pytest.approx(100.0)  # at the limit: no spread, no slippage
     assert lot.fees == pytest.approx(100.0 * lot.qty * 0.0015)  # maker fee
     assert lot.lot_id == entry_event["lot"]
     fill = engine.outbox[1]
     assert fill["type"] == "entry_fill" and fill["lot"] == lot.lot_id
+
+
+def test_limit_entry_touched_but_never_traded_through_expires(cfg):
+    engine = make_engine(
+        limit_cfg(cfg, timeout=2), StubStrategy(fire_at=3, stop_pct=2.0, target_pct=5.0)
+    )
+    df = bars_from_closes([100.0] * 8, wick=0.0)  # every bar touches 100, none goes below
+    for n in range(1, len(df) + 1):
+        engine.on_bar("BTC/USD", _window(df, n))
+    assert not engine.open and not engine.resting
+    assert any(e["type"] == "entry_cancel" for e in engine.outbox)
+
+
+def test_fill_on_touch_when_through_is_zero(cfg):
+    cfg.orders.limit_fill_through_bps = 0.0
+    engine = make_engine(limit_cfg(cfg), StubStrategy(fire_at=3, stop_pct=2.0, target_pct=5.0))
+    df = bars_from_closes([100.0] * 5, wick=0.0)
+    for n in range(1, 5):
+        engine.on_bar("BTC/USD", _window(df, n))
+    assert engine.open["BTC/USD"][0].entry_price == pytest.approx(100.0)
 
 
 def _window(df, n):
@@ -194,6 +217,7 @@ def test_every_closed_trade_logs_planned_and_actual_r(cfg):
 
 # ---------------------------------------------------------------- router feedback
 def test_shrink_lot_and_close_lot_at_follow_the_real_account(cfg):
+    cfg.orders.limit_fill_through_bps = 0.0  # fill on the touch: this test is about shrinking
     engine = make_engine(limit_cfg(cfg), StubStrategy(fire_at=3, stop_pct=2.0, target_pct=5.0))
     df = bars_from_closes([100.0, 100.0, 100.0, 100.2], wick=0.0)
     for n in range(1, 5):

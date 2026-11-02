@@ -129,6 +129,7 @@ def test_short_signals_are_refused(cfg):
 
 def test_paper_simulator_ignores_limit_entries(cfg):
     cfg.orders.entry_type = "limit"
+    cfg.orders.limit_fill_through_bps = 0.0  # flat bars: only a touch fill can fill here
     df = bars_from_closes([100, 100, 100, 100], wick=0.0)
     engine, _ = make_engine(cfg, StubStrategy(fire_at=2, stop_pct=1.0))
     feed(engine, df)

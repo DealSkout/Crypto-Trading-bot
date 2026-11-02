@@ -217,3 +217,25 @@ def test_the_broker_stop_covers_exactly_the_coins_received(tmp_path):
     assert accounts["a"].positions["BTC/USD"][0] == pytest.approx(held)
     stop = [o for o in venue.open_orders() if o.type == "stop_limit"][0]
     assert stop.qty == pytest.approx(held)
+
+
+def test_venue_resting_limit_needs_price_to_trade_through_it():
+    venue = PaperVenue(10_000.0, CM, fill_through_bps=2.0)
+    venue.mark("BTC/USD", 100.5)
+    order = venue.place_order("BTC/USD", "buy", 1.0, order_type="limit", limit_price=100.0)
+    venue.mark("BTC/USD", 100.0)  # a touch: still queued
+    assert venue.get_positions() == []
+    venue.mark("BTC/USD", 99.99)  # 1 bp through: not enough
+    assert venue.get_positions() == []
+    venue.mark("BTC/USD", 99.97)  # 3 bp through: filled at the limit as a maker
+    pos = venue.get_positions()
+    assert pos and pos[0].qty == pytest.approx(1.0)
+    assert venue.get_order(order.id).avg_fill_price == pytest.approx(100.0)
+
+
+def test_venue_default_still_fills_on_touch():
+    venue = PaperVenue(10_000.0, CM)
+    venue.mark("BTC/USD", 100.5)
+    venue.place_order("BTC/USD", "buy", 1.0, order_type="limit", limit_price=100.0)
+    venue.mark("BTC/USD", 100.0)
+    assert venue.get_positions()
